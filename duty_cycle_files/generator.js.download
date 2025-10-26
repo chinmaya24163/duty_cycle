@@ -1,0 +1,1378 @@
+(function() {
+
+  /*
+  object for creating and updating <svg> elements representing the waveform in the given waveData object
+  */
+  /*
+  determines whether the input is a number
+  @param {Number, String, ...} num value of any type to test if type is Number of some sort
+  @return {Boolean} true if num is a {Number}, else false
+  */
+  var $, SignalValue, Utils, Variable, WaveformGenerator, isNumber;
+
+  [$, SignalValue, Variable, Utils] = [];
+
+  WaveformGenerator = (function() {
+    class WaveformGenerator {
+      /*
+      constructs a new WaveformGenerator object
+      @param {WaveformViewer} pane, the containing {WaveformViewer} pane.
+      @param {Object} waveData the waveData object that stores the relevant waveData object
+      @param {String} path the html path to this element
+      */
+      constructor(pane, waveData, path) {
+        var j, len, len1, ref, v;
+        /*
+        Same interface as drawBusSignal.
+        */
+        this.drawBitSignal = this.drawBitSignal.bind(this);
+        /*
+        draw one value and one change for a multiwire signal (bus)
+        @param {SignalValue} sv the signal value to draw
+        @param {int} startPix the starting pixel
+        @param {int} endPix the ending pixel
+        @param {Boolean} offStart true if the transition creating this value occurred outside of view.
+        @param {Boolean} offEnd true if the transition ending this value occurs outside of view.
+        @return {Array<String, int>} the string representation for the svg data for this value and transition,
+                                     and the end x position of the value.
+        */
+        this.drawBusSignal = this.drawBusSignal.bind(this);
+        this.pane = pane;
+        this.path = path;
+        this.isChrome = navigator.userAgent.search("Chrome") > -1;
+        this.isFirefox = navigator.userAgent.search("Firefox") > -1;
+        this.currentStart = waveData.getStartCycle();
+        this.currentEnd = waveData.getEndViewerCycle();
+        this.textRegionWidth = 0;
+        this.cyclesPerPixel = 0;
+        this.svgHeight = 0;
+        this.waveData = waveData;
+        this.timescale = {
+          number: 1,
+          unit: "whocares" // ignore timescale; everything is cycles; @waveData.getTimescale()
+        };
+        // set viz cycle from viz pane, if it exists yet.
+        this.initializeCurrentSigs();
+        this.numVisible = 0;
+        
+        // Get longest name to determine nameRegion width
+        this.nameLen = 10; // min
+        ref = this.allRows;
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          v = ref[j];
+          if (v.type === "wire") {
+            len = v.notFullName.length;
+            if (len > this.nameLen) {
+              this.nameLen = len;
+            }
+          }
+        }
+        if (this.nameLen > 35) { // max
+          this.nameLen = 35;
+        }
+      }
+
+      setCursorEl(cursorElName, cyc) {
+        var lineHeight, position;
+        if (this.cyclesPerPixel > 0) {
+          position = Math.round((cyc - this.currentStart) / this.cyclesPerPixel + this.textRegionWidth);
+          lineHeight = this.svgHeight;
+          $(`.${cursorElName}`).html(`<line x1=\"${position}\" y1=\"0\" x2=\"${position}\" y2=\"${lineHeight}\"></line>`);
+          return $(`.${cursorElName}Ruler`).html('<line x1="' + `${position}` + '" y1="0" x2="' + `${position}` + '" y2="20"></line>');
+        }
+      }
+
+      /*
+      Moves the cursor on the waveform to the given cycle
+      @param {Number} cyc the (phase-granular) cycle to which to move the cursor
+      */
+      setLineByCycle(cyc) {
+        var el, i, j, len1, ref, row, sig, text, title, v, valid;
+        if (cyc < this.currentStart || cyc > this.currentEnd) {
+          $(".verticalLine").html("");
+          $(".verticalLineRuler").html("");
+        } else {
+          this.setCursorEl("verticalLine", cyc);
+        }
+        i = 0;
+        ref = this.allRows;
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          row = ref[j];
+          if (!row.visible) {
+            continue;
+          }
+          if (row.type === "wire" || row.type === "real") {
+            sig = this.waveData.getSignalByName(row.key);
+            if (sig) {
+              [v, valid] = sig.getValueAndValidAtCycle(cyc);
+              if (typeof v === "string") {
+                // TODO: The ID "#value_<#>" could easily collide with something else.
+                [text, title] = SignalValue.representValue(row.type, v, sig.width, valid, this.CHARS_IN_VALUE_REGION);
+                el = $(`#value_${i}`);
+                el.attr("mc-valid", `${valid}`);
+                el.html(`<title>${title}</title>${text}`);
+              } else {
+                Utils.assert(false, `Waveform viewer bug. Couldn't find value of signal ${row.key} at cycle ${cyc}.`);
+              }
+            } else {
+              Utils.assert(false, `Waveform viewer bug. Signal ${row.key} could not be found.`);
+            }
+          }
+          i++;
+        }
+        return this.lineCycle = cyc;
+      }
+
+      /*
+      Set the viz cursor to the given cycle.
+      @param {Number} cyc the cycle to which to move the cursor
+      */
+      setVizCursorCycle(cyc) {
+        if (cyc === null || cyc < this.currentStart || cyc > this.currentEnd) {
+          $(`#${this.path}-vizCursor`).html("");
+          $(`#${this.path}-vizCursorRuler`).html("");
+          return this.updateBubblePosition(null);
+        } else {
+          this.setCursorEl("vizCursor", cyc);
+          return this.updateBubblePosition(cyc);
+        }
+      }
+
+      updateBubblePosition(cyc) {
+        var bubbleEl, pixelPosition;
+        bubbleEl = $("#vizBubble");
+        if (cyc === null) {
+          return bubbleEl.css('display', 'none');
+        } else {
+          pixelPosition = (cyc - this.currentStart) / this.cyclesPerPixel + this.textRegionWidth;
+          return bubbleEl.css('left', `${pixelPosition}px`).css('display', 'block');
+        }
+      }
+
+      /*
+      Moves the vertical line to the given signal's next transition after the given cycle
+      [Unused]
+      @param {String} signal the signal to snap to
+      @param {Number} cyc the minimum cycle of the transition
+      */
+      setLineBySignalCycle(signal, cyc) {
+        var s, sv;
+        s = this.waveData.getSignalByName(signal);
+        sv = new SignalValue(s, cyc);
+        return this.setLineByCycle(sv.getTransitionCycle());
+      }
+
+      /*
+      Moves the vertical line to the position on the page
+      @param {Number} pos the position to move to
+      */
+      setLineByPosition(pos) {
+        return this.setLineByCycle(Math.round((pos - this.textRegionWidth) * this.cyclesPerPixel + this.currentStart));
+      }
+
+      /*
+      Zoom in on the waveform by a factor of 2.
+      If the marker is in view, zoom around the marker, otherwise
+      zoom around the center.
+      */
+      zoomIn(scale = 2, focalCycle = null) {
+        var currentWidth, focalRatio, newEnd, newStart, newWidth, ref;
+        currentWidth = this.currentEnd - this.currentStart;
+        // Determine focalCycle if not provided
+        if (focalCycle == null) {
+          focalCycle = (this.lineCycle != null) && ((this.currentStart <= (ref = this.lineCycle) && ref <= this.currentEnd)) ? this.lineCycle : (this.currentStart + this.currentEnd) / 2;
+        }
+        newWidth = currentWidth / scale;
+        focalRatio = (focalCycle - this.currentStart) / currentWidth;
+        newStart = focalCycle - (newWidth * focalRatio);
+        newEnd = newStart + newWidth;
+        return this.generateWave(newStart, newEnd);
+      }
+
+      /* Zooms out on the waveform by a factor of 2. If focalCycle is provided, zoom around that point. */
+      zoomOut(scale = 2, focalCycle = null) {
+        var currentWidth, focalRatio, fullWidth, maxEnd, maxStart, newEnd, newStart, newWidth;
+        maxStart = this.waveData.getStartCycle();
+        maxEnd = this.waveData.getEndViewerCycle();
+        fullWidth = maxEnd - maxStart;
+        currentWidth = this.currentEnd - this.currentStart;
+        newWidth = currentWidth * scale;
+        // If we’re already at or beyond full view, just reset
+        if (newWidth >= fullWidth) {
+          this.generateWave();
+          return;
+        }
+        // Determine focalCycle if not provided
+        if (focalCycle == null) {
+          focalCycle = (this.currentStart + this.currentEnd) / 2;
+        }
+        focalRatio = (focalCycle - this.currentStart) / currentWidth;
+        newStart = focalCycle - (newWidth * focalRatio);
+        newEnd = newStart + newWidth;
+        // Clamp to bounds
+        if (newStart < maxStart) {
+          newStart = maxStart;
+          newEnd = newStart + newWidth;
+        }
+        if (newEnd > maxEnd) {
+          newEnd = maxEnd;
+          newStart = newEnd - newWidth;
+        }
+        return this.generateWave(newStart, newEnd);
+      }
+
+      /*
+      zooms out to see the entire waveform
+      */
+      zoomFull() {
+        return this.generateWave();
+      }
+
+      /*
+      moves left on the waveform view if possible
+      */
+      moveLeft() {
+        var maxStart, newStart, quarter, width;
+        width = this.currentEnd - this.currentStart;
+        maxStart = this.waveData.getStartCycle();
+        quarter = Math.ceil(width / 4);
+        newStart = this.currentStart - quarter;
+        if (newStart < maxStart) {
+          newStart = maxStart;
+        }
+        return this.generateWave(newStart, newStart + width);
+      }
+
+      /*
+      moves right on the waveform view if possible
+      */
+      moveRight() {
+        var end, maxEnd, quarter, width;
+        width = this.currentEnd - this.currentStart;
+        maxEnd = this.waveData.getEndViewerCycle();
+        quarter = Math.ceil(width / 4);
+        end = this.currentEnd + quarter;
+        if (end > maxEnd) {
+          end = maxEnd;
+        }
+        return this.generateWave(end - width, end);
+      }
+
+      reachStart() {
+        var maxStart, width;
+        maxStart = this.waveData.getStartCycle();
+        width = this.currentEnd - this.currentStart;
+        return this.generateWave(maxStart, maxStart + width);
+      }
+
+      reachEnd() {
+        var maxEnd, width;
+        maxEnd = this.waveData.getEndViewerCycle();
+        width = this.currentEnd - this.currentStart;
+        return this.generateWave(maxEnd - width, maxEnd);
+      }
+
+      /*
+      Helper for initializeCurrentSigs.
+      */
+      initializeCurrentSigsGuts(indentation_str, scope) {
+        var child, childLi, fullScope, fullScopePrefix, li, liPrefix, name, obj, ports, ref, ref1, results, sig;
+        // characterize this scope
+        li = fullScope = scope.getFullScope();
+        // Strip TLV top scope.  TODO: Ugly
+        if (li.startsWith(Variable.tlvTopScopeName)) {
+          li = li.substring(Variable.tlvTopScopeName.length);
+        }
+        liPrefix = li + ((li === "") || scope.isTlv ? "" : ".");
+        fullScopePrefix = fullScope + ((fullScope === "") || scope.isTlv ? "" : ".");
+        ref = scope.sigs;
+        
+        // for signals
+        for (name in ref) {
+          sig = ref[name];
+          ports = sig.ports != null ? sig.ports : "";
+          obj = {
+            key: sig.fullName, // == fullScopePrefix + name, except for clk/reset special-case
+            signal: sig, // TODO: Eliminate redundant fields.
+            scope: fullScope, // == sig.scope except for clk and reset
+            name: sig.fullName + ports, // TODO: Strip ports.
+            notFullName: sig.notFullName,
+            ports: ports,
+            visible: true,
+            type: sig.type,
+            width: sig.width,
+            data: sig.data,
+            svg: "", // SVG for the wave at generation svgGeneration
+            svgGeneration: -1, // See @generation.
+            domGeneration: -1, // See @domGeneration.
+            cycle: sig.cycle
+          };
+          this.allRows.push(obj);
+        }
+        ref1 = scope.children;
+        
+        // for children
+        results = [];
+        for (name in ref1) {
+          child = ref1[name];
+          
+          // add scope line
+
+          childLi = liPrefix + name;
+          if (childLi === "") {
+            childLi = "TLV";
+          }
+          obj = {
+            key: childLi,
+            scope: fullScopePrefix + name,
+            name: indentation_str + name,
+            li: childLi,
+            type: "SCOPE",
+            visible: true,
+            expanded: true
+          };
+          this.allRows.push(obj);
+          
+          // recurse
+          results.push(this.initializeCurrentSigsGuts(indentation_str + "  ", child));
+        }
+        return results;
+      }
+
+      /*
+      Initializes the current signals in the waveform
+      (currently all signals as given by vcd, but paves way for trimming, rearranging shown signals)
+      */
+      initializeCurrentSigs() {
+        var top;
+        this.allRows = [];
+        top = this.waveData.sigHier;
+        return this.initializeCurrentSigsGuts("", top);
+      }
+
+      /*
+      Expands a scope to display all of its signals and nested scopes, without re-rendering.
+      Currently more of a hack that keeps display hierarchy in an array rather than a proper hierarchy
+      @TODO refactor with classes and actual hierarchy
+      @param {String} li the logical instance of the scope to expand
+      */
+      expandScope(li) {
+        var currentScope, inScope, j, l, len1, ogScope, outOfScope, overHidden, ref, ref1, results, signal, visArr, x;
+        inScope = false;
+        ogScope = []; //original scope
+        currentScope = [];
+        visArr = [];
+        overHidden = false;
+        ref = this.allRows;
+        results = [];
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          signal = ref[j];
+          if (signal.type === "SCOPE") { //treat SCOPE signals differently than actual signals
+            if (outOfScope = inScope && signal.visible) { //reached the end of the scope, leave loop
+              break;
+            }
+            if (!inScope && signal.li === li) { //reached start of scope to expand
+              inScope = true;
+              signal.expanded = true;
+              ogScope = currentScope = signal.scope.split(/[\/|>\.]/g); // splits by / | > .
+              for (x = l = 0, ref1 = ogScope.length; (0 <= ref1 ? l < ref1 : l > ref1); x = 0 <= ref1 ? ++l : --l) {
+                visArr.push(true);
+              }
+              continue;
+            }
+            if (inScope) { //scope that is nested within expanding scope somewhere
+              results.push([overHidden, visArr, currentScope] = this.helpExpandScope(signal, overHidden, visArr, currentScope));
+            } else {
+              results.push(void 0);
+            }
+          } else if (inScope && !overHidden) {
+            results.push(signal.visible = true);
+          } else {
+            results.push(void 0);
+          }
+        }
+        return results;
+      }
+
+      /*
+      Helper method for expandScope, processes a single scope that is nested in the scope being expanded
+      @param {Object} signal the scope signal being processed
+      @param {Boolean} overHidden whether this scope is being hidden by a parent scope
+      @param {Array<Boolean>} visArr a boolean array representing expanded and collapsed parent scopes
+      @param {Array<String>} currentScope an array of strings representing this scope's hierarchy
+      @return {[Boolean, Array<Boolean>, Array<String>]} returns updated `overHidden`, `visArr`, and `currentScope`
+      */
+      helpExpandScope(signal, overHidden, visArr, currentScope) {
+        var i, j, last, ref, tempScope;
+        tempScope = signal.scope.split(/[\/|>\.]/g); // splits by / | > .
+        last = 0;
+        for (i = j = 0, ref = Math.min(tempScope.length, currentScope.length); (0 <= ref ? j < ref : j > ref); i = 0 <= ref ? ++j : --j) {
+          if (tempScope[i] === currentScope[i]) {
+            last = i;
+          }
+        }
+        visArr = visArr.slice(0, +last + 1 || 9e9);
+        if (visArr[visArr.length - 1]) {
+          overHidden = !signal.expanded;
+          signal.visible = true;
+          visArr.push(signal.expanded);
+        } else {
+          overHidden = true;
+        }
+        currentScope = tempScope;
+        return [overHidden, visArr, currentScope];
+      }
+
+      /*
+      Expands all scopes such that all signals within them will be shown.
+      @return {Boolean} true if any changes were made requiring @generateWave(...)
+      */
+      expandAllScopes() {
+        var j, len1, ref, signal;
+        ref = this.allRows;
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          signal = ref[j];
+          if (signal.type === "SCOPE") {
+            signal.expanded = true;
+          }
+          signal.visible = true;
+        }
+        return true; // Just assume there was an update for now.
+      }
+
+      /*
+      Collapses all scopes to only top scope, without re-rendering.
+      @return {Boolean} true if any changes were made requiring @generateWave(...)
+      */
+      collapseAllScopes() {
+        var index, j, len1, ref, signal;
+        index = 0;
+        ref = this.allRows;
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          signal = ref[j];
+          if (signal.type === "SCOPE") {
+            signal.expanded = false;
+            signal.visible = signal.name === signal.scope; // visible iff top-level scope
+          } else {
+            signal.visible = signal.scope === ""; // visible iff top-level signal
+          }
+          index++;
+        }
+        return true; // Just assume there was an update for now.
+      }
+
+      /*
+      Collapses a scope so its signals and nested scopes are not displayed, without re-rendering.
+      @TODO refactor with classes and actual hierarchy
+      @param {String} li the logical instance of the scope to collapse
+      */
+      collapseScope(li) {
+        var fullScope, inScope, j, len1, ref, results, signal, word_char_re;
+        inScope = false;
+        fullScope = "";
+        word_char_re = /^[a-zA-Z0-9_]$/;
+        ref = this.allRows;
+        results = [];
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          signal = ref[j];
+          if (signal.type === "SCOPE") { // treat scope signals differently
+            if (signal.li === li) {
+              // li scope line
+              fullScope = signal.scope;
+              inScope = true;
+              signal.expanded = false;
+              continue;
+            }
+            /*
+            if the new scope doesn't start with the entire original scope (or continues with a word char),
+            then we have exited the collapsing scope and should stop
+            */
+            if (inScope) {
+              if ((signal.scope.indexOf(fullScope) !== 0) || (word_char_re.test(signal.scope.charAt(fullScope.length)))) {
+                // Out-of-scope li
+                inScope = false;
+                break;
+              } else {
+                // Sub-li scope
+                signal.expanded = false;
+              }
+            }
+          }
+          if (inScope) { // all signals within this scope need to be hidden
+            results.push(signal.visible = false);
+          } else {
+            results.push(void 0);
+          }
+        }
+        return results;
+      }
+
+      /*
+      main method for generating the actual <svg> for the waveform. has two optional start and end options
+      TODO: Don't regenerate buttons and defs every time.
+      @param {Number} start optional argument giving start cycle
+      @param {Number} end optional argument giving end cycle
+      @param {Number} windowWidth **OPTIONAL** New width at which to generate.
+      @return {String} the string representation of the svg output
+      */
+      generateWave(start, end, windowWidth) {
+        var html, newEnd, newStart, textRegion, view, width;
+        this.visibleRows = [];
+        html = "";
+        newStart = start != null ? start : this.waveData.getStartCycle();
+        newEnd = end != null ? end : this.waveData.getEndViewerCycle();
+        windowWidth = windowWidth != null ? windowWidth : this.windowWidth;
+        width = newEnd - newStart;
+        // Record view changes.
+        this.domGeneration++;
+        if (this.currentStart !== newStart || this.currentEnd !== newEnd || this.windowWidth !== windowWidth) {
+          this.generation++; // Thus invalidating all @allRows[x].svg. Might want to scrub these.
+          this.currentStart = newStart;
+          this.currentEnd = newEnd;
+          this.windowWidth = windowWidth;
+        }
+        textRegion = this.nameLen * 8;
+        textRegion = Math.min(textRegion, windowWidth / 3);
+        this.textRegionWidth = textRegion + this.VALUE_REGION_WIDTH;
+        this.waveRegion = windowWidth - this.textRegionWidth;
+        if (this.waveRegion < 0) {
+          this.waveRegion = 0; // and don't generate waves & ruler if 0 width
+        }
+        this.pixelsPerCycle = this.waveRegion / width; // Pixels per cycle
+        this.cyclesPerPixel = width / this.waveRegion;
+        this.numVisible = this.getNumVisible();
+        this.svgHeight = this.ELEMENT_HEIGHT * this.numVisible;
+        html += `<!-- Begin Ruler -->
+<div data-WaveformViewer-ruler="data-WaveformViewer-ruler"><svg
+    xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1"
+    id="${this.path}-svg-ruler" width="${windowWidth}" height="${this.ELEMENT_HEIGHT}">
+  <defs>
+    <g id="b"><rect width="1" height="${this.ELEMENT_HEIGHT}" style="fill:rgb(0,0,0);stroke-width:0"></rect></g>
+    <g id="gray"><rect width="1" height="${this.ELEMENT_HEIGHT}" style="fill:dimGray;stroke-width:0"></rect></g>
+    <g id="majorMark"><line x1="0" y1="18" x2="0" y2="0" style="stroke:honeydew; stroke-width:1"/></g>
+    <g id="minorMark"><line x1="0" y1="18" x2="0" y2="12" style="stroke:honeydew; stroke-width:1"/></g>
+    <g id="rulerLine"><line x1="0" y1="18" x2="1" y2="18" style="stroke:honeydew; stroke-width:1"/></g>
+  </defs>`;
+        if (this.waveRegion > 0) {
+          html += this.createRuler();
+        }
+        html += `  <g class="verticalLineRuler" style="display:block; stroke-width:1" transform="translate(0,0)"></g>
+  <g class="vizCursorRuler" style="display:block; stroke-width:1" transform="translate(0,0)" id="${this.path}-vizCursorRuler"></g>
+  
+</svg></div>
+<div id="${this.path}-waveform-body-wrapper", data-WaveformViewer-body-wrapper="data-WaveformViewer-body-wrapper">
+<svg
+  xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1"
+  width="${windowWidth}" height="${this.svgHeight}" style="background:#202020">
+<defs>
+  <g id="b"><rect width="1" height="${this.ELEMENT_HEIGHT}" style="fill:rgb(0,0,0);stroke-width:0"></rect></g>
+  <g id="gray"><rect width="1" height="${this.ELEMENT_HEIGHT}" style="fill:dimGray;stroke-width:0"></rect></g>
+  <g id="BlurValidBus"><rect x="0" y="2" width="1" height="18" style="fill:bisque"/></g>
+  <g id="BlurValidBit"><rect x="0" y="2" width="1" height="18" style="fill:turquoise"/></g>
+  <g id="BlurUnkValidity"><rect x="0" y="2" width="1" height="18" style="fill:crimson"/></g>
+  <g id="BlurInvalid"><rect x="0" y="2" width="1" height="18" style="fill:gray"/></g>
+  <g id="xEdge"><line x1="0" y1="18" x2="0" y2="2" style="stroke:crimson; stroke-width:1"/></g>
+  <g id="risingEdge"><line x1="0" y1="18" x2="0" y2="2" style="stroke:lime; stroke-width:1"/></g>
+  <g id="zeroToZ"><line x1="0" y1="18" x2="0" y2="10" style="stroke:lime; stroke-width:1"/></g>
+  <g id="ZToOne"><line x1="0" y1="10" x2="0" y2="2" style="stroke:lime; stroke-width:1"/></g>
+  <g id="fallingEdge"><line x1="0" y1="2" x2="0" y2="18" style="stroke:turquoise; stroke-width:1"/></g>
+  <g id="oneToZ"><line x1="0" y1="2" x2="0" y2="10" style="stroke:turquoise; stroke-width:1"/></g>
+  <g id="ZToZero"><line x1="0" y1="10" x2="0" y2="18" style="stroke:turquoise; stroke-width:1"/></g>
+  <g id="bus">
+    <line x1="0" y1="18" x2="1" y2="18" style="stroke:bisque; stroke-width:1"/>
+    <line x1="0" y1="2" x2="1" y2="2" style="stroke:bisque; stroke-width:1"/>
+  </g>
+  <g id="xbus">
+    <line x1="0" y1="18" x2="1" y2="18" style="stroke:crimson; stroke-width:1"/>
+    <line x1="0" y1="2" x2="1" y2="2" style="stroke:crimson; stroke-width:1"/>
+  </g>
+  <g id="busStart">
+    <line x1="0" y1="10" x2="1.5" y2="2" style="stroke:bisque; stroke-width:1"/>
+    <line x1="0" y1="10" x2="1.5" y2="18" style="stroke:bisque; stroke-width:1"/>
+  </g>
+  <g id="xbusStart">
+    <line x1="0" y1="10" x2="1.5" y2="2" style="stroke:crimson; stroke-width:1"/>
+    <line x1="0" y1="10" x2="1.5" y2="18" style="stroke:crimson; stroke-width:1"/>
+  </g>
+  <g id="busEnd">
+    <line x1="0" y1="18" x2="1.5" y2="10" style="stroke:bisque; stroke-width:1"/>
+    <line x1="0" y1="2" x2="1.5" y2="10" style="stroke:bisque; stroke-width:1"/>
+  </g>
+  <g id="xbusEnd">
+    <line x1="0" y1="18" x2="1.5" y2="10" style="stroke:crimson; stroke-width:1"/>
+    <line x1="0" y1="2" x2="1.5" y2="10" style="stroke:crimson; stroke-width:1"/>
+  </g>
+  <g id="busChange">
+    <line x1="0" y1="18" x2="3" y2="2" style="stroke:bisque; stroke-width:1"/>
+    <line x1="0" y1="2" x2="3" y2="18" style="stroke:bisque; stroke-width:1"/>
+  </g>
+  <g id="DCBitEdge"><line x1="0" y1="2" x2="0" y2="18" style="stroke:gray;stroke-width:1"></line></g>
+  <g id="DCOneToZ"><line x1="0" y1="2" x2="0" y2="10" style="stroke:Peru; stroke-width:1"></line></g>
+  <g id="DCZeroToZ"><line x1="0" y1="18" x2="0" y2="10" style="stroke:Peru; stroke-width:1"></line></g>
+  <g id="ZToDCOne"><line x1="0" y1="10" x2="0" y2="2" style="stroke:gray; stroke-width:1"></line></g>
+  <g id="ZToDCZero"><line x1="0" y1="10" x2="0" y2="18" style="stroke:gray; stroke-width:1"></line></g>
+  <g id="DCBusStart">
+    <line x1="0" y1="10" x2="1.5" y2="2" style="stroke:gray;stroke-width:1"></line>
+    <line x1="0" y1="10" x2="1.5" y2="18" style="stroke:gray;stroke-width:1"></line>
+  </g>
+  <g id="DCBus">
+    <line x1="0" y1="2" x2="1" y2="2" style="stroke:gray;stroke-width:1"></line>
+    <line x1="0" y1="18" x2="1" y2="18" style="stroke:gray;stroke-width:1"></line>
+  </g>
+  <g id="DCBusEnd">
+    <line x1="0" y1="18" x2="1.5" y2="10" style="stroke:gray; stroke-width:1"></line>
+    <line x1="0" y1="2" x2="1.5" y2="10" style="stroke:gray; stroke-width:1"></line>
+  </g>
+</defs>`;
+        if (this.waveRegion > 0) {
+          html += this.createWaves(textRegion);
+        }
+        // Using triple quotes for correct string interpolation
+        html += `<g class="verticalLine" style="display:block;" transform="translate(0,0)"></g>`; // container
+        html += `<g class="vizCursor" style="display:block;" transform="translate(0,0)" id="${this.path}-vizCursor"></g>`;
+        html += "</div></svg>";
+        //-@svg = html
+        this.pane.toHTML(html);
+        // Get scrolling element
+        view = $(`#${this.path}-waveform-body-wrapper`);
+        view.on("scroll", (e) => {
+          return this.scrolled();
+        });
+        if (this.waveRegion > 0) {
+          return this.createWavesInView();
+        }
+      }
+
+      /*
+      Draw a line in the give style.
+      @param {Number} from
+      @param {Number} to
+      @param {String} style
+      */
+      drawLine(from, to, style) {
+        return '<line x1="' + from + '" y1="0" x2="' + to + '" y2="0" style="stroke:' + strokeOf[style] + '"/>';
+      }
+
+      /*
+      Gets the number of visible signals in the waveform
+      @return {Number} the number of visible signals
+      */
+      getNumVisible() {
+        var j, len1, ref, sum, v;
+        sum = 0;
+        ref = this.allRows;
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          v = ref[j];
+          if (v.visible) {
+            sum++;
+          }
+        }
+        return sum;
+      }
+
+      /*
+      creates time ruler above waveforms
+      @return {String} returns the string representation of the svg ruler
+      */
+      createRuler() {
+        var end, interval, intervalSpace, next, offset, out, position, roundOffset, roundStart, smallInterval, start, tempStart, tick;
+        start = this.currentStart;
+        end = this.currentEnd;
+        next = start;
+        interval = this.getIntervalSize(start, end);
+        smallInterval = interval / 10;
+        offset = 0;
+        out = "";
+        out += '<g class="ruler" transform="translate(0,0)">';
+        out += '<use xlink:href="#gray" transform="scale(' + this.windowWidth + ',1)"/>';
+        out += '<g transform="translate(' + this.textRegionWidth + ',0)">';
+        out += '<use xlink:href="#rulerLine" transform="scale(' + this.waveRegion + ',1)"/>';
+        if (start % interval === 0) {
+          offset = 0;
+          out += '<use xlink:href="#majorMark" transform="translate(' + offset + ')"/>';
+          out += '<text class="time" x="1" y="12">' + this.addCommas(start * this.timescale.number) + "</text>";
+          tempStart = start;
+        } else {
+          if (start % smallInterval === 0) {
+            offset = 0;
+            out += '<use xlink:href="#minorMark" transform="translate(' + offset + ')"/>';
+            tempStart = start;
+          } else {
+            roundStart = smallInterval * Math.ceil(start / smallInterval);
+            offset = this.pixelsPerCycle * (roundStart - start);
+            roundOffset = Math.round(offset.toFixed(2));
+            if (roundStart % interval === 0) {
+              out += `<use xlink:href="#majorMark" transform="translate(${roundOffset})" />`;
+              if (next <= end) {
+                out += `<text class="time" x="1" y="12" transform="translate(${roundOffset})">
+  ${this.addCommas(roundStart * this.timescale.number)}
+</text>`;
+              }
+            } else {
+              out += '<use xlink:href="#minorMark" transform="translate(' + roundOffset + ')"/>';
+            }
+            tempStart = roundStart;
+          }
+        }
+        roundStart = tempStart + smallInterval;
+        intervalSpace = this.pixelsPerCycle * smallInterval;
+        while (true) {
+          tick = offset + intervalSpace;
+          position = Math.round(tick.toFixed(2));
+          next = roundStart + smallInterval;
+          if (roundStart % interval === 0) {
+            out += '<use xlink:href="#majorMark" transform="translate(' + position + ')"/>';
+            if (next <= end) {
+              out += `<text class="time" x="1" y="12" transform="translate(${position})">
+  ${this.addCommas(roundStart * this.timescale.number)}
+</text>`;
+            }
+          } else {
+            out += '<use xlink:href="#minorMark" transform="translate(' + position + ')"/>';
+          }
+          offset = tick;
+          roundStart = next;
+          if (!(roundStart <= end)) {
+            break;
+          }
+        }
+        return out + "</g></g>";
+      }
+
+      /*
+      creates the remainder of the svg containing both the names and the waveforms
+      @param {Number} textRegion the width of the name portion of the row
+      @param {String} returns the string representation of the wave portion of the svg
+      */
+      createWaves(textRegion) {
+        var count, expand, fullName, index, j, le, len1, li, name, out, ref, sign, tempName, wave;
+        out = "";
+        count = 0;
+        ref = this.allRows;
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          wave = ref[j];
+          if (!wave.visible) {
+            // Take this opportunity to remove any stale cached SVG string.
+            if (wave.generation >= 0 && wave.generation < this.generation) {
+              wave.svg = "";
+              wave.generation = -1;
+              wave.domGeneration = -1;
+            }
+            continue;
+          }
+          this.visibleRows.push(wave);
+          name = wave.name;
+          // scope lines
+          if (wave.type === "SCOPE") {
+            // default logical entity/instance as if SV.
+            le = wave.li;
+            li = wave.li;
+            if (wave.scope.startsWith(Variable.tlvTopScopeName) && (wave.scope.length > Variable.tlvTopScopeName.length)) {
+              //tempName = wave.scope.replace(/\[[0-9]+:[0-9]+\]/g, "") # remove like [15:0]
+              tempName = wave.scope;
+              li = tempName.substring(Variable.tlvTopScopeName.length);
+              le = li.replace(/\[[0-9]+\]/g, ""); // remove like [3]
+            }
+            
+            //add value and wave name backgrounds, specifying scope class
+            out += `<g transform="translate(0, ${count * this.ELEMENT_HEIGHT})" logical_entity="${le}" logical_instance="${li}">
+  <rect
+    class="value scope" width="${this.textRegionWidth - textRegion}" height="${this.ELEMENT_HEIGHT}"
+    transform="translate(${textRegion}, 0)"></rect>
+  <rect
+    class="waveName waveName${count} scope" width="1" height="${this.ELEMENT_HEIGHT}"
+    transform="scale(${textRegion}, 1)"></rect>`;
+            //Add the + - buttons to show collapsibility/expandibility
+            if (wave.expanded) {
+              expand = "waveCollapse";
+              sign = " - ";
+            } else {
+              expand = "waveExpand";
+              sign = " + ";
+            }
+            out += `<text class="${expand}" x="-4" y="15" text-anchor="start" xml:space="preserve"><title></title>${sign}</text>`;
+            //add the name of the scope
+            out += '<text class="scope" x="16" y="15" text-anchor="start" xml:space="preserve"><title>';
+            out += name = wave.name;
+            out += `</title>${name}</text>`;
+            //add the value text region (always empty)
+            out += `<text
+  id="value_${count}" class="value" x="${30 - 4}" y="15" transform="translate(${textRegion})"
+  text-anchor="end">
+  <title></title>
+</text>`;
+            //add black bar in wave portion, and full scope name
+            out += `<g class="wave" transform="translate(${this.textRegionWidth}, 0)">
+  <rect class="wavescope" width="${this.windowWidth - this.textRegionWidth}" height="20"></rect>
+  <text class="wavescope" x="4" y="15" text-anchor="start" xml:space="preserve">
+    <title>${li}</title>
+    ${li}
+   </text>
+ </g>
+ </g>`;
+            count++;
+            continue;
+          }
+          //nonscope lines
+          le = wave.name;
+          li = wave.name;
+          if (wave.scope.startsWith(Variable.tlvTopScopeName)) {
+            tempName = wave.name.replace(/\[[0-9]+:[0-9]+\]/g, ""); // remove like [15:0]
+            li = tempName.substring(tempName.indexOf(Variable.tlvTopScopeName) + Variable.tlvTopScopeName.length);
+            if (li.indexOf("@") > -1) {
+              // Remove @#.
+              li = li.substring(0, li.indexOf("@")) + li.substring(li.indexOf("$"));
+            }
+            le = li.replace(/\[[0-9]+\]/g, ""); // remove like [3]
+          }
+          out += '<g transform="translate(0,' + count * this.ELEMENT_HEIGHT + ')" logical_entity="' + le + '" logical_instance="' + li + '">';
+          //add value and wave name backgrounds
+          out += `<rect
+  class="value" width="${this.textRegionWidth - textRegion}" height="${this.ELEMENT_HEIGHT}"
+  transform="translate(${textRegion},0)"></rect>
+<rect
+  class="waveName waveName${count}" width="1" height="${this.ELEMENT_HEIGHT}"
+  transform="scale(${textRegion},1)"></rect>`;
+          //add the text for the name of the signal
+          out += `<text class="name name${count}" x="${textRegion}" y="15" text-anchor="end" xml:space="preserve"><title>`;
+          fullName = "";
+          name = "";
+          if ((wave.cycle != null) && wave.cycle !== void 0) {
+            index = wave.notFullName.lastIndexOf("$");
+            name = `@${wave.cycle}` + wave.notFullName.substring(index);
+            if (wave.name.startsWith(Variable.tlvTopScopeName)) {
+              fullName = wave.name.substring(Variable.tlvTopScopeName.length, index) + name;
+            } else {
+              fullName = wave.name.substring(0, index) + name;
+            }
+          } else {
+            name = wave.notFullName;
+            fullName = wave.name;
+          }
+          out += fullName + `</title>${name}</text>`;
+          //add value text region (starts empty, set using jQuery in setLineByCycle)
+          out += `<text
+  id="value_${count}" class="value" x="${30 - 4}" y="15" transform="translate(${textRegion})"
+  text-anchor="end">
+  <title></title>
+</text>`;
+          //start the waveform portion of the signal
+          out += '<g class="wave" transform="translate(' + this.textRegionWidth + ',0)" mc-wave-container="' + (this.visibleRows.length - 1) + '">';
+          out += '</g></g>';
+          count++;
+        }
+        return out;
+      }
+
+      /*
+      Create SVG of the waves that are in view.
+      */
+      createWavesInView() {
+        var bottom, bottomRow, i, j, ref, ref1, results, top, topRow, view, wave;
+        view = $(`#${this.pane.path}-waveform-body-wrapper`);
+        // The pixel y-coordinate of the top of the waveform view based on the scroll position.
+        top = view.scrollTop();
+        bottom = top + view.height();
+        topRow = Math.floor(top / this.ELEMENT_HEIGHT);
+        bottomRow = Math.floor(bottom / this.ELEMENT_HEIGHT);
+        if (topRow < 0) {
+          topRow = 0;
+        }
+        if (bottomRow >= this.visibleRows.length) {
+          bottomRow = this.visibleRows.length - 1;
+        }
+        results = [];
+        for (i = j = ref = topRow, ref1 = bottomRow; (ref <= ref1 ? j <= ref1 : j >= ref1); i = ref <= ref1 ? ++j : --j) {
+          wave = this.visibleRows[i];
+          if (wave.type === "SCOPE") {
+            // Do nothing.
+            continue;
+          }
+          // Generate and record the svg for the signal's waveform. These can be reused if scopes are closed and reopened.
+          // Note, currently, since we're not removing individual waves from the DOM, there's no need to cache wave.svg, but we do.
+          if (wave.svgGeneration !== this.generation) {
+            wave.svg = this.createWave(wave);
+            wave.svgGeneration = this.generation;
+          }
+          if (wave.domGeneration !== this.domGeneration) {
+            Utils.$one(`[mc-wave-container='${i}']`).html(wave.svg);
+            results.push(wave.domGeneration = this.domGeneration);
+          } else {
+            results.push(void 0);
+          }
+        }
+        return results;
+      }
+
+      /*
+      The waves view was scrolled to the given scrollTop().
+      */
+      scrolled() {
+        return this.createWavesInView();
+      }
+
+      /*
+      Create the wave SVG for a signal in @allRows.
+      */
+      createWave(wave) {
+        var out, sv;
+        if (wave.type !== "SCOPE") {
+          sv = new SignalValue(wave.signal, this.currentStart);
+        }
+        out = '<rect width="' + (this.windowWidth - this.textRegionWidth) + '" height="20"></rect>';
+        if (wave.type === "real") {
+          out += this.processSignal(sv, this.drawBusSignal);
+        } else {
+          Utils.assert(typeof wave.width === "number");
+          if (wave.width === 1) {
+            out += this.processSignal(sv, this.drawBitSignal);
+          } else {
+            if (wave.width !== 0) {
+              out += this.processSignal(sv, this.drawBusSignal);
+            }
+          }
+        }
+        return out;
+      }
+
+      /*
+      create svg row for a multibit signal (bus)
+      @param {SignalValue} sv the SignalValue for this signal, initialize to cycle = @currentStart.
+      @return {String} the string representation of the svg for this multibit signal
+      */
+      processSignal(sv, drawFn) {
+        var blur, doDraw, done, endCycle, endPix, lastEndPix, offEnd, offStart, offWave, out, startPix, thisBlur;
+        out = ""; // SVG string
+        lastEndPix = 0; // The endPix of the previous wave value.
+        startPix = 0; // The pixel from which to start drawing the wave value.
+        blur = false; // Label of blurred rect to use from startPix.
+        done = false;
+        while (true) {
+          // Determine end transition cycle, which is cut off at the end of the visible area, but extended by 1
+          // so the end-of-trace transition is not visible.
+          endCycle = sv.getNextTransitionCycle();
+          offWave = typeof endCycle === "undefined";
+          offEnd = offWave || endCycle > this.currentEnd;
+          // Draw wave value.
+          if (offEnd) {
+            // endCycle could be undefined. Assign it to extend beyond visible area.
+            endCycle = this.currentEnd + 1;
+          }
+          endPix = Math.round(this.pixelsPerCycle * (endCycle - this.currentStart));
+          done = offWave || endPix >= this.waveRegion;
+          // Do nothing if zero pixels wide.
+          if (endPix > lastEndPix) {
+            // Handle blurring.
+            doDraw = endPix - lastEndPix >= 1.5;
+            thisBlur = doDraw ? false : sv.isValid() ? (drawFn === this.drawBusSignal ? "ValidBus" : "ValidBit") : typeof sv.isValid() === "undefined" ? "UnkValidity" : "Invalid"; // wide enough to not blur
+            // TODO: what about x values?
+            // Draw the prior blur, unless this blur can be absorbed into it.
+            if (blur && (blur !== thisBlur)) {
+              out += this._drawBlur(blur, startPix, lastEndPix);
+              startPix = lastEndPix;
+            }
+            blur = thisBlur;
+            if (doDraw) {
+              offStart = sv.getTransitionCycle() < sv.getCycle();
+              out += drawFn(sv, startPix, endPix, offStart, offEnd);
+              startPix = endPix;
+            }
+            lastEndPix = endPix;
+          }
+          if (done) {
+            if (blur) {
+              out += this._drawBlur(blur, startPix, endPix);
+            }
+            break;
+          }
+          sv.goToNextTransition();
+        }
+        return out;
+      }
+
+      /*
+      Draw blur of values.
+      @param {String} blur mnemonic for the blur type
+      @param {int} startPix starting pixel (x-coord)
+      @param {int} endPix ending pixel (x-coord)
+      */
+      _drawBlur(blur, startPix, endPix) {
+        Utils.assert(Number.isInteger(endPix - startPix));
+        return `<use
+  xlink:href="#Blur${blur}"
+  transform="translate(${startPix},-0.5) scale(${endPix - startPix},1)" />`;
+      }
+
+      drawBitSignal(sv, startPix, endPix, offStart, offEnd) {
+        var group, out, valid, value;
+        valid = sv.isValid();
+        value = sv.getLegacyValue().toString();
+        if (value === "0") {
+          out = '<line x1="' + startPix + '" y1="18.5" x2="' + endPix + '" y2="18.5" style="stroke:turquoise; stroke-width:1"/>';
+        } else if (value === "1") {
+          out = '<line x1="' + startPix + '" y1="2.5" x2="' + endPix + '" y2="2.5" style="stroke:lime; stroke-width:2"/>';
+        } else if (value === "Z") {
+          out = '<line x1="' + startPix + '" y1="10.5" x2="' + endPix + '" y2="10.5" style="stroke:Peru; stroke-width:1"/>';
+        } else if (value === "W0") {
+          if (valid === false) {
+            out = '<line x1="' + startPix + '" y1="18.5" x2="' + endPix + '" y2="18.5" style="stroke:gray; stroke-width:1"/>';
+          } else {
+            out = '<line x1="' + startPix + '" y1="18.5" x2="' + endPix + '" y2="18.5" style="stroke:crimson; stroke-width:1"/>';
+          }
+        } else if (value === "W1") {
+          if (valid === false) {
+            out = '<line x1="' + startPix + '" y1="2.5" x2="' + endPix + '" y2="2.5" style="stroke:gray; stroke-width:2"/>';
+          } else {
+            out = '<line x1="' + startPix + '" y1="2.5" x2="' + endPix + '" y2="2.5" style="stroke:crimson; stroke-width:2"/>';
+          }
+        } else {
+          // else, presumably value is "x"
+          `<rect x="${startPix}" y="2.5" width="${endPix - startPix}" height="16" style="fill:crimson;stroke-width:0; opacity:0.5"/>
+<line x1="${startPix}" y1="2.5" x2="${endPix}" y2="2.5" style="stroke:crimson; stroke-width:1"/>
+<line x1="${startPix}" y1="18.5" x2="${endPix}" y2="18.5" style="stroke:crimson; stroke-width:1"/>
+</rect>`;
+        }
+        if (!offEnd) {
+          group = this.getEdge(sv.getValueStr(), sv.isValid(), sv.getNextTransitionValueStr(), sv.isNextTransitionValid());
+          if (group) {
+            out += `<use xlink:href=\"#${group}\" transform=\"translate(${endPix}, 0.5)\"/>`;
+          }
+        }
+        return out;
+      }
+
+      /*
+      Determines which ID to use for a bus, given the results from getBusIntervalText
+      */
+      busID(allX, valid) {
+        if (allX || typeof valid === "undefined") {
+          return "#xbus";
+        } else if (valid) {
+          return "#bus";
+        } else {
+          return "#DCBus";
+        }
+      }
+
+      drawBusSignal(sv, startPix, endPix, offStart, offEnd) {
+        var allX, midDist, out, temp;
+        if (offStart) {
+          // Compensate for no start transition (<) at trace start.
+          startPix -= 1.5;
+        }
+        midDist = endPix - startPix - 3;
+        if (offEnd) {
+          // The visible area ends at the edge of the waveform region, not at the made-up end-transition cycle.
+          midDist = this.waveRegion - startPix - 1.5;
+        }
+        out = "";
+        // Text
+        [allX, temp] = this.getBusIntervalText(sv, sv.getLegacyValue(), midDist, startPix);
+        // Draw: <===>
+        // <
+        if (!offStart) {
+          out += `<use
+  xlink:href="${this.busID(allX, sv.isValid())}Start"
+  transform="translate(${startPix}, 0.5)" />`;
+        }
+        // ===
+        if (midDist > 0) {
+          out += `<use
+  xlink:href="${this.busID(allX, sv.isValid())}"
+  transform="translate(${startPix + 1.5}, 0.5) scale(${midDist},1)" />`;
+          out += temp;
+        }
+        // >
+        if (!offEnd) {
+          out += `<use xlink:href=\"${this.busID(allX, sv.isValid())}End\"` + ` transform=\"translate(${endPix - 1.5}, 0.5)\" />`;
+        }
+        return out;
+      }
+
+      /*
+      gets transition edge between two signal values for a single bit signal
+      @param {String} last the value (as VCD value string) before the transition
+      @param {Boolean, undefined} lastValid validity of last value
+      @param {String} next the value (as VCD value string) after the transition
+      @param {Boolean, undefined} nextValid validity of next value
+      @return {String} the transition edge type
+      */
+      getEdge(last, lastValid, next, nextValid) {
+        if (next === last) {
+          return "";
+        } else {
+          if (next === "X" || typeof nextValid === "undefined") {
+            return "xEdge";
+          }
+          switch (last) {
+            case "0":
+              return this.getEdgeFromZero(next, nextValid);
+            case "1":
+              return this.getEdgeFromOne(next, nextValid);
+            case "Z":
+              return this.getEdgeFromZ(next, nextValid);
+            case "X":
+              return "xEdge";
+            case "W0":
+              return this.getEdgeFromDCZero(next, nextValid);
+            case "W1":
+              return this.getEdgeFromDCOne(next, nextValid);
+            default:
+              return "";
+          }
+        }
+      }
+
+      /*
+      gets transition edge from zero to the next value
+      @param {Number, String} next the next value of the signal
+      @param {Boolean} nextValid validity of next value
+      @return {String} the transition edge type
+      */
+      getEdgeFromZero(next, nextValid) {
+        switch (next) {
+          case "1":
+            return (nextValid ? "risingEdge" : "DCBitEdge");
+          case "Z":
+            return "zeroToZ";
+        }
+        return "";
+      }
+
+      /*
+      gets transition edge from one to the next value
+      @param {Number, String} next the next value of the signal
+      @param {Boolean} nextValid validity of next value
+      @return {String} the transition edge type
+      */
+      getEdgeFromOne(next, nextValid) {
+        switch (next) {
+          case "0":
+            return (nextValid ? "fallingEdge" : "DCBitEdge");
+          case "Z":
+            return "oneToZero";
+        }
+        return "";
+      }
+
+      /*
+      gets transition edge from Z to the next value
+      @param {Number, String} next the next value of the signal
+      @param {Boolean} nextValid validity of next value
+      @return {String} the transition edge type
+      */
+      getEdgeFromZ(next, nextValid) {
+        switch (next) {
+          case "0":
+            return (nextValid ? "ZToZero" : "ZToDCZero");
+          case "1":
+            return (nextValid ? "ZToOne" : "ZToDCOne");
+        }
+        return "";
+      }
+
+      /*
+      gets transition edge from don't care zero to next value
+      @param {Number, String} next the next value of the signal
+      @param {Boolean} nextValid validity of next value
+      @return {String} the transition edge type
+      */
+      getEdgeFromDCZero(next, nextValid) {
+        switch (next) {
+          case "1":
+            return (nextValid ? "risingEdge" : "DCBitEdge");
+          case "Z":
+            return "DCZeroToZ";
+        }
+        return "";
+      }
+
+      /*
+      gets transitionedge from don't care one to next value
+      @param {Number, String} next the next value of the signal
+      @param {Boolean} nextValid validity of next value
+      @return {String} the transition edge type
+      */
+      getEdgeFromDCOne(next, nextValid) {
+        switch (next) {
+          case "0":
+            return (nextValid ? "fallingEdge" : "DCBitEdge");
+          case "Z":
+            return "DCOneToZ";
+        }
+        return "";
+      }
+
+      /*
+      gets the interval size between major marks
+      @param {Number} start the starting cycle
+      @param {Number} end the end cycle
+      @return {Number} the major mark interval size
+      */
+      getIntervalSize(start, end) {
+        var f, k, numPixelWidth, width;
+        width = end - start;
+        numPixelWidth = this.addCommas(end * this.timescale.number).length * 8;
+        f = width / (this.waveRegion / Math.max(numPixelWidth, 100));
+        k = 1;
+        while (f > 50) {
+          k *= 10;
+          f /= 10;
+        }
+        if (f <= 10) {
+          return 10 * k;
+        } else {
+          if (f <= 20) {
+            return 20 * k;
+          } else {
+            if (f <= 50) {
+              return 50 * k;
+            }
+          }
+        }
+      }
+
+      /*
+      gets text that displays in a single bus value region
+      @param {SignalValue} sv the signal value to draw
+      @param {Number} lastValue the value of the bus region
+      @param {Number} dif the space for the text in pixels
+      @param {Number} roundLoc the location for the text
+      @return {String} the string representation of the html for this text
+      */
+      getBusIntervalText(sv, lastValue, dif, roundLoc) {
+        var allX, j, len1, ref, space, style, temp, text, title, val, valid, x;
+        valid = sv.isValid();
+        val = sv.getValueStr(); // Binary string or real value string.
+        space = dif > 0 ? Math.floor(dif / this.CHARACTER_WIDTH) : 0; // space for text in chars
+        [text, title] = SignalValue.representValue(sv.signal.type, val, sv.signal.width, valid, space);
+        allX = true;
+        ref = val.split("");
+        for (j = 0, len1 = ref.length; j < len1; j++) {
+          x = ref[j];
+          if (x !== "x") {
+            allX = false;
+          }
+        }
+        if (text) {
+          style = allX || typeof valid === "undefined" ? 'style="fill:crimson" ' : valid ? "" : 'style="fill:gray" ';
+          temp = `<text class="busData" x="0" y="14" ${style} transform="translate(${roundLoc + 2.5})">
+  <title>${title}</title>
+  ${text}
+</text>`;
+          return [allX, temp];
+        }
+        return [false, ""];
+      }
+
+      /*
+      inserts commas into a number as appropriate
+      @param {Number, String} num the number to add commas to
+      @return {String} the number with commas inserted
+      */
+      addCommas(num) {
+        return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+      }
+
+    };
+
+    // @property {WaveformViewer} the {WaveformViewer} pane.
+    WaveformGenerator.prototype.pane = null;
+
+    // @property {String} path the html String tag for this element
+    WaveformGenerator.prototype.path = "";
+
+    // @property {Number} the width at which the entire svg was last drawn
+    WaveformGenerator.prototype.windowWidth = 0;
+
+    // @property {Number} the width of the waveform region
+    WaveformGenerator.prototype.waveRegion = 0;
+
+    // @property {Number} constant for the height of one wave in the waveform
+    WaveformGenerator.prototype.ELEMENT_HEIGHT = 20;
+
+    // @property {Number} constant for the pixel width of one character
+    WaveformGenerator.prototype.CHARACTER_WIDTH = 8;
+
+    // @property {Number} constant for the width of the value region
+    WaveformGenerator.prototype.VALUE_REGION_WIDTH = 30;
+
+    // @property {Number} constant for the number of characters that can fit in the value region
+    WaveformGenerator.prototype.CHARS_IN_VALUE_REGION = 3;
+
+    // @property {Boolean} true if the browser is Google Chrome, else false
+    WaveformGenerator.prototype.isChrome = false;
+
+    // @property {Boolean} true if the browser is Mozilla Firefox, else false
+    WaveformGenerator.prototype.isFirefox = false;
+
+    // @property {Number} the starting cycle of when signal data will be displayed
+    WaveformGenerator.prototype.currentStart = 0;
+
+    // @property {Number} the end cycle of when signal data will be displayed
+    WaveformGenerator.prototype.currentEnd = 0;
+
+    // @property {Number} the number of pixels per cycle (can be fractional)
+    WaveformGenerator.prototype.pixelsPerCycle = 0;
+
+    // @property {Number} the width in pixels of the space displaying signal names
+    WaveformGenerator.prototype.textRegionWidth = 0;
+
+    // @property {Number} how many cycles are currently represented by the width of one pixel
+    WaveformGenerator.prototype.cyclesPerPixel = 0;
+
+    // @property {Number} how high the entire svg is in pixels
+    WaveformGenerator.prototype.svgHeight = 0;
+
+    // @property {Boolean} true if loading, else false
+    WaveformGenerator.prototype.loading = false;
+
+    // @property {Object} the object holding all of the signal data
+    WaveformGenerator.prototype.waveData = null;
+
+    // @property {Object} object representing the timescale
+    WaveformGenerator.prototype.timescale = null;
+
+    //-# @property {String} the string representation of the currently displayed svg element
+    //-svg: ""
+    // @property {Number} the current cycle that the cursor is on
+    WaveformGenerator.prototype.lineCycle = 0;
+
+    // @property {Array} the signals and scopes of the waveform view, ordered as displayed
+    //     TODO: This should use a properly-defined class and could use some better structure.
+    WaveformGenerator.prototype.allRows = null;
+
+    // @property {Array} rows of @allRows that are visible (visible == true), ordered as displayed
+    WaveformGenerator.prototype.visibleRows = null;
+
+    // @property {Number} how many signals (including scopes) the viewer is currently displaying
+    WaveformGenerator.prototype.numVisible = 0;
+
+    // @property {Number} the length of the longest signal name (to a maximum value), to determine width of name region
+    WaveformGenerator.prototype.nameLen = 0;
+
+    // @property {Number} Incremented for each new render scale; used to invalidate cached SVG without freeing it.
+    //                    The current policy frees stale strings when collapsed (not "visible") or recomputed.
+    WaveformGenerator.prototype.generation = -1;
+
+    // @property {Number} Increment for each new render, which invalidates the SVG in the DOM.
+    WaveformGenerator.prototype.domGeneration = -1;
+
+    return WaveformGenerator;
+
+  }).call(this);
+
+  isNumber = function(num) {
+    return !isNaN(num - 0) && (typeof a !== "undefined" && a !== null) && a !== false && a !== "";
+  };
+
+  define(function(require, exports, module) {
+    $ = require("jquery");
+    Utils = require("Utils");
+    SignalValue = require("VCD/SignalValue");
+    Variable = require("VCD/Variable");
+    $.extend(WaveformGenerator.prototype, module.config());
+    return WaveformGenerator;
+  });
+
+}).call(this);

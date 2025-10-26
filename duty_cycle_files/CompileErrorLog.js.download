@@ -1,0 +1,240 @@
+(function() {
+  define("ErrorLog", function(require, exports, module) {
+    /*
+    A module that displays compile errors.
+
+    @extend Pane
+    @extend ModuleConfigObject
+    */
+    var $, CompileErrorLog, Logging, Pane, Utils, livestamp, moment;
+    Pane = require("Pane");
+    $ = require("jquery");
+    Logging = require("Logging");
+    Utils = require("Utils");
+    moment = require("moment");
+    require("livestamp");
+    livestamp = $.fn.livestamp;
+    CompileErrorLog = (function() {
+      class CompileErrorLog extends Pane {
+        /*
+        Provides model initialization (called by @initPane())
+        */
+        modelInit() {
+          this.flags();
+          this.compileID(null);
+          this.stdall("");
+          this.makeout("");
+          this.exitCode(null);
+          return this.time(null);
+        }
+
+        init(name, ide, project, tabbedview) {
+          this.compileID = null;
+          return this.initPane("ErrorLog", name, ide, project, tabbedview, {
+            statusFlags: {},
+            compileID: null,
+            stdall: "",
+            makeout: "",
+            exitCode: null,
+            time: null
+          });
+        }
+
+        saveDOMState() {
+          return {
+            scrollTop: Utils.$one(`#${this.path}-msg`).scrollTop()
+          };
+        }
+
+        restoreDOMState(state) {
+          return Utils.$one(`#${this.path}-msg`).scrollTop(state.scrollTop);
+        }
+
+        /*
+        Flags have been disabled (but may be added back at some point).
+        Sets the different flags in the model, to be shown with check/x status.
+        Values can be:
+        - `null`: Hasn't been set yet.  (`fa-circle-o`)
+        - `true`: Ran successfully.  (`fa-checkmark`)
+        - `false`: Run failed.  (`fa-x`)
+        - `"running"`: Currently running, no output.  (`fa-spinner fa-pulse`)
+        */
+        flags(val = null) {
+          return this;
+        }
+
+        /*
+        Populates stdall in the DOM.
+        @param {string} stdall The value to set as stdall
+        @return CompileErrorLog
+        */
+        stdall(stdall) {
+          Utils.$one(`#${this.path}-msg-stdall`).html(stdall);
+          return this;
+        }
+
+        /*
+        Populates makeout in DOM.
+        @param {String} makeout The value to set as makeout
+        @return CompileErrorLog
+        */
+        makeout(makeout) {
+          Utils.$one(`#${this.path}-msg-makeout`).html(makeout);
+          return this;
+        }
+
+        /*
+        Sets time for timestamps.
+        @param {Date} time The value to set as time
+        @return CompileErrorLog
+        */
+        time(time) {
+          Utils.$one(".timestamp", this.paneEl).livestamp(time);
+          return this;
+        }
+
+        /*
+        Sets exitCode in the DOM.
+        @param {String} exitCode The value to set as exitCode
+        @return {CompileErrorLog} this
+        */
+        exitCode(exitCode) {
+          Utils.$one(`#${this.path}-exit-code`, this.paneEl).html(exitCode);
+          return this;
+        }
+
+        /*
+        Sets compileID and updates the DOM.
+        @param {Integer} compileID The value to set as compileID
+        @return {CompileErrorLog} this
+        */
+        setCompileID(compileID) {
+          this.compileID = compileID;
+          Utils.$one(`#${this.path}-compile-id`, this.paneEl).text(this.compileID);
+          return this;
+        }
+
+        /*
+        Converts a log entry into HTML.
+        */
+        logtoHTML(log) {
+          var color;
+          color = log.severity === "stderr" ? "red" : "black";
+          return `<div style="color: ${color}" data-severity="${log.severity}">${log.message}</div>`;
+        }
+
+        /*
+        Registers the compiler.
+        Listens to varous events during the compilation run.
+        @param {SandPiperCompiler} compiler The value to set as compiler
+        @return CompileErrorLog
+        */
+        compiler(compiler) {
+          // New Events:
+          compiler.on("m4/done", (data) => {
+            //return if @model.get "serialized"
+            this.flags("running");
+            this._stdall = [];
+            this._makeout = [];
+            return this.prepLogOutput(data.compile);
+          });
+          compiler.on("graphviz/done", (data) => {
+            return this.setFlag("graph", data.success === "success");
+          });
+          compiler.on("verilator/done", (data) => {
+            return this.setFlag("vcd", data.success === "success");
+          });
+          compiler.on("sandpiper/done", (data) => {
+            this.setFlag("navTLV", data.success === "success");
+            if (data.exitCode) {
+              return this.exitCode(code);
+            }
+          });
+          compiler.on("stdall", (data) => {
+            if (this._stdall == null) {
+              this._stdall = [];
+            }
+            this._stdall[data.index] = {
+              message: data.message,
+              severity: data.severity
+            };
+            return this.stdall(this._stdall.filter(function(i) {
+              return i;
+            }).map(this.logtoHTML).join(""));
+          });
+          compiler.on("makeout", (data) => {
+            if (this._makeout == null) {
+              this._makeout = [];
+            }
+            this._makeout[data.index] = {
+              message: data.message,
+              severity: data.severity
+            };
+            return this.makeout = this._makeout.filter(function(i) {
+              return i;
+            }).map(this.logtoHTML).join("");
+          });
+          // Old Events:
+          compiler.on("stdall/all", (data) => {
+            return this.stdall(data);
+          });
+          compiler.on("makeout/all", (data) => {
+            return this.makeout(data);
+          });
+          return this;
+        }
+
+        /*
+        Set a compilation step flag's status.
+        This is disabled for now, but may be resurrected.
+        @param {String} the name of a compilation step
+        @param {Anything} the value to set
+        */
+        setFlag(name, val) {}
+
+        oldSetFlag(name, val) {
+          var flags;
+          //debugger
+          if (this.model.get("serialized")) {
+            return;
+          }
+          flags = this.model.get("statusFlags");
+          if (flags[name]) {
+            flags[name].val = val;
+          }
+          this.model.set("flags", flags);
+          return this.model.invalidate("statusFlags");
+        }
+
+        /*
+        Prepares for new log output.
+        If this traffic has a new compileID, clear state for a new compilation and prep the DOM.
+        Update timestamp.
+        @param {String} compileID The compileID of the traffic.
+        @return {CompileErrorLog} this
+        */
+        prepLogOutput(id) {
+          if (this.compileID !== id) {
+            this.stdall("");
+            this.makeout("");
+            this.exitCode(null);
+            this.time(new Date());
+            this.setFlag("compile", true);
+            this.setCompileID(id);
+          }
+          return this;
+        }
+
+      };
+
+      // @property {Integer} Compile ID of the last log output.
+      CompileErrorLog.prototype.compileID = null;
+
+      return CompileErrorLog;
+
+    }).call(this);
+    Utils.extend(CompileErrorLog, module.config(), true, true);
+    return CompileErrorLog;
+  });
+
+}).call(this);

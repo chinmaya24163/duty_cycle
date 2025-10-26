@@ -1,0 +1,393 @@
+(function() {
+  var boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  define("Editor", function(require, exports, module) {
+    /*
+    A module that includes a CodeMirror editing pane.
+    Note that this class handles autocompile, but {ProjectManager} handles autosave.
+
+    @extend Pane
+    @extend ModuleConfigObject
+    */
+    var $, CodeMirror, Editor, Logging, Pane, PanelLabel, Utils;
+    Pane = require("Pane");
+    $ = require("jquery");
+    Logging = require("Logging");
+    Utils = require("Utils");
+    PanelLabel = require("PanelLabel");
+    CodeMirror = require("codemirror");
+    require("codemirror/mode/verilog/verilog");
+    require("codemirror/addon/selection/active-line");
+    require("codemirror/addon/fold/foldcode");
+    require("codemirror/addon/fold/foldgutter");
+    require("codemirror/addon/fold/comment-fold");
+    require("codemirror/addon/fold/indent-fold");
+    require("codemirror/addon/search/search");
+    require("codemirror/addon/search/searchcursor");
+    require("codemirror/addon/search/jump-to-line");
+    Editor = (function() {
+      class Editor extends Pane {
+        constructor() {
+          super(...arguments);
+          /*
+          Triggers a compilation.
+          @param {Boolean} immediate `no` to wait a fixed amount of time before compiling,
+                           ignoring other compiles until then.
+                           TODO: This looks like a hack for synchronization issues. It is used when initially loading the IDE.
+                                 It would be better to ensure that the IDE is fully loaded before compiling.
+          @param {Boolean} alreadyLoaded `true` if the (localConnected) file was just loaded into the editor.
+          TODO: Move this to new Session class.
+          */
+          this.compile = this.compile.bind(this);
+          /*
+          Compile the given code.
+          */
+          this.compileThis = this.compileThis.bind(this);
+        }
+
+        init(name, ide, project, tabbedview) {
+          return this.initPane("Editor", name, ide, project, tabbedview);
+        }
+
+        // @overridden
+        // Codemirror must be initialized into an element that exists in the DOM, so we initialize
+        // here, rather than in init(..).
+        initOpened() {
+          var actions;
+          this.codemirror();
+          actions = [
+            {
+              name: "Compile/Sim (<Ctrl>-Enter)",
+              href: `#${this.childPath("label-compile")}`
+            },
+            {
+              name: "Show Verilog",
+              href: `#${this.childPath("label-stats")}`
+            },
+            {
+              name: "Open Results",
+              href: `#${this.childPath("label-results")}`
+            }
+          ];
+          return this.addLabel({
+            initial: "E",
+            actions
+          }).then((label) => {
+            var el;
+            Utils.assert(this.label === label);
+            el = label.el;
+            el.off("click");
+            el.on("click", `[href='#${this.childPath("label-compile")}']`, (e) => {
+              console.log(`Compiling from ${this.childPath("label")}`);
+              e.preventDefault();
+              return this.compile();
+            });
+            el.on("click", `[href='#${this.childPath("label-stats")}']`, (e) => {
+              e.preventDefault();
+              if (!this.compiler) {
+                return;
+              }
+              return this.compiler.showStats();
+            });
+            el.on("click", `[href='#${this.childPath("label-results")}']`, (e) => {
+              e.preventDefault();
+              if (!this.compiler) {
+                return;
+              }
+              return this.compiler.showResults();
+            });
+            return this;
+          });
+        }
+
+        /*
+        Override for open.
+        TODO: Proper overriding doesn't work because we dont use coffeescript 'extends'.
+              No way to prevent calls to open(..).
+        @param tabbedview
+        @tlv TLV code to load into the Editor if truthy.
+        */
+        openTLV(tabbedview, tlv) {
+          return this.open(tabbedview).then(() => {
+            if (tlv) {
+              return this.setTLV(tlv, true, true);
+            }
+          });
+        }
+
+        /*
+        Load TLV code.
+        @param {String} tlv The TLV code to load into the editor.
+        @param {boolean} clear Whether to clear the history of the old contents.
+        @param {boolean} comp Whether to compile the code.
+        @param {boolean} triggerChange Whether to trigger a change event. By default, trigger change if there is
+                            a project (otherwise this initial code came from somewhere, so no save needed). Also
+                            if unspecified, provide an alert if there are unsaved changes.
+        @return {boolean} success (false if the editor is readonly)
+        */
+        setTLV(tlv, clear, comp, triggerChange = "default") {
+          var ret, trigger;
+          trigger = triggerChange;
+          if (triggerChange === "default") {
+            trigger = this.project.path != null;
+          }
+          ret = this.setValue(tlv, trigger);
+          if (triggerChange === "default") {
+            // If there are unsaved changes, or there is an active project, alert the user.
+            if (this.project.path != null) {
+              Utils.alert("Replaced project code. You can recover it with Ctrl-Z.");
+            } else if (this.project.saveState.state === "modified") {
+              Utils.alert("Replaced Editor code. You can recover it with Ctrl-Z.");
+            }
+            // If there's no project, there are no longer unsaved changes, since this code came from somewhere.
+            if (this.project.path == null) {
+              if (this.project.saveState.state === "modified") {
+                this.project.saveState.state = null;
+              }
+              // Treat this as clean (to avoid an alert on unload).
+              this.project.saveChangeGeneration = this.editor.changeGeneration();
+            }
+          }
+          if (ret) {
+            if (clear) {
+              this.editor.getDoc().clearHistory();
+            }
+            if (comp) {
+              this.compile(true);
+            }
+          }
+          return ret;
+        }
+
+        /*
+        Sets compiler.
+        @param {ServerCompile} compiler The value to set as compiler
+        @return Editor
+        */
+        setCompiler(compiler) {
+          this.compiler = compiler;
+          return this;
+        }
+
+        compile(immediate = false, alreadyLoaded = false) {
+          var doCompile;
+          boundMethodCheck(this, Editor);
+          doCompile = () => {
+            var project;
+            if (!this.compiler) {
+              return;
+            }
+            // TODO: Isolate IDE and ProjectManager.
+            project = null;
+            if ((this.ide != null) && (this.ide.project != null)) {
+              project = this.ide.project;
+              // TODO: This is an odd place for this, but here I know there's a project and a compilation to do.
+              // Stop playing the simulation if it's running. Seems a little awkward to leave it running, and
+              // this minimizes (hides?) issue accessing a non-existent canvas.
+              project.updatePlayState(false);
+            } else {
+              project = {
+                localConnected: false
+              };
+            }
+            if (!project.localConnected) {
+              this.setStatus("none");
+            }
+            this.compileChangeGeneration = this.editor.changeGeneration();
+            if (project.localConnected && !alreadyLoaded) {
+              // Load the connected file into the editor and compile it.
+              this.project.localFileHandle.getFile().then(function(file) {
+                return file.text();
+              }).then((text) => {
+                this.compileThis(text);
+                //@project.saveState.saveDate = new Date()
+                return this.setValue(text, false, true);
+              }).catch(function(err) {
+                return Utils.alert(`Error reading connected source file \"${project.localFileHandle.name}\": ${err.toString()}`);
+              });
+            } else {
+              this.compileThis(this.editor.getValue());
+            }
+            return this._compileWait = null;
+          };
+          if (this._compileWait) {
+            return;
+          }
+          return this._compileWait = setTimeout(doCompile, (immediate ? 0 : 750));
+        }
+
+        compileThis(code) {
+          boundMethodCheck(this, Editor);
+          return this.compiler.compile(code, function(id) {
+            return console.log(`Started compilation ${id}`);
+          });
+        }
+
+        /*
+        Initializes a CodeMirror instance inside the Editor.
+        */
+        codemirror() {
+          this.editor = CodeMirror($("[data-Editor]", this.paneEl).get(0), {
+            value: "",
+            mode: "text/x-tlv",
+            theme: "tlv-basic",
+            lineNumbers: true,
+            matchBrackets: false,
+            smartIndent: true,
+            indentUnit: 3,
+            tabSize: 3,
+            electricChars: false,
+            styleActiveLine: true,
+            foldGutter: {
+              rangeFinder: new CodeMirror.fold.combine(CodeMirror.fold.indent, CodeMirror.fold.comment)
+            },
+            gutters: ["CodeMirror-linenumbers", "CodeMirror-foldgutter"],
+            extraKeys: this.keybindings()
+          });
+          this.editor.on('changes', () => {
+            this.hideLabel();
+            if (this.editor.isClean(this.compileChangeGeneration)) {
+              return this.setStatus("none");
+            } else {
+              this.setStatus("outdated");
+              if (this.constructor.AUTOCOMPILE) {
+                // TODO: AUTOCOMPILE is not currently in use, but if it is resurrected, it must be made more intelligent.
+                //       There should be a distinction between requested compiles and autocompiles, and autocompiles
+                //       shouldn't squash a requested one that is pending. Probably shouldn't autocompile if there is
+                //       a pending autocompile, either, until it completes.
+                return this.compile();
+              }
+            }
+          });
+          return this.refreshLater();
+        }
+
+        /*
+        After the editor is loaded, it seems to be necessary to refresh code mirror after asynchronous initialization,
+        and I can't find a hook to do it. So, we use timeouts to refresh a few times after successive delays.
+        (Debugger breakpoints could result in the passage of time without code execution, thus breaking this mechanism.)
+        */
+        refreshLater() {
+          return setTimeout(() => {
+            return setTimeout(() => {
+              // after short delay from last event in queue
+              this.editor.refresh();
+              return setTimeout(() => {
+                // in case initialization is slow delay
+                this.editor.refresh();
+                return setTimeout(() => {
+                  // catch-all after long delay
+                  return this.editor.refresh();
+                }, 5000);
+              }, 500);
+            }, 100);
+          }, 0);
+        }
+
+        /*
+        Returns additional keybindings for CodeMirror.
+        @return {Object} An object in [Key Map](https://codemirror.net/doc/manual.html#keymaps) format.
+          `null` if no additional keybindings are desired.
+        */
+        keybindings() {
+          return {
+            "Ctrl-Enter": () => {
+              return this.compile(true);
+            },
+            "Alt-Enter": () => {
+              return this.compile(true);
+            }
+          };
+        }
+
+        saveDOMState() {
+          return this.editor.getScrollInfo();
+        }
+
+        restoreDOMState(state) {
+          return setTimeout(() => {
+            this.editor.refresh();
+            this.editor.scrollTo(state.left, state.top);
+            return setTimeout(() => {
+              this.editor.refresh();
+              this.editor.scrollTo(state.left, state.top);
+              return setTimeout(() => {
+                this.editor.refresh();
+                return this.editor.scrollTo(state.left, state.top);
+              }, 100);
+            }, 10);
+          }, 0);
+        }
+
+        resize() {
+          return this.editor.refresh();
+        }
+
+        /*
+        Sets the text showing in the text editor.
+        @param {String} str the text to insert into the editor
+        @param {boolean} triggerChange whether to trigger a change event
+        @param {boolean} true permits updates to connected code
+        @return {boolean} success (false if the editor is readonly)
+        */
+        setValue(str, triggerChange = true, readOnlyOkay = false) {
+          var ret;
+          ret = !this.editor.getOption("readOnly") || readOnlyOkay;
+          if (ret) {
+            this.changeEnabled = triggerChange;
+            this.editor.setValue(str);
+            this.changeEnabled = true;
+          } else {
+            Utils.alert(`Cannot load the requested code since the current project is connected to a local file. Use a new ${this.config.product} window.`);
+          }
+          return ret;
+        }
+
+        /*
+        Activate this tab.
+        */
+        activate() {
+          return this.tabbedview.activatePane(this);
+        }
+
+        /*
+        Set the cursor inside the editor.
+        @param {int|Object} line either the line number or `{line, ch}`
+        @param {int} char the character position
+        */
+        setCursor(line, char) {
+          return this.editor.setCursor(line, char);
+        }
+
+        /*
+        Return the number of lines in the document.
+        @return {int} the number of lines in the editor.
+        */
+        lineCount() {
+          return this.editor.lineCount();
+        }
+
+      };
+
+      // @property {Boolean} `true` if compile should be triggered on keystroke
+      Editor.AUTOCOMPILE = false;
+
+      // @property {int} the "change generation" (see codemirror) of the last compile.
+      Editor.prototype.compileChangeGeneration = -1;
+
+      // @property {ServerCompile} The compiler.
+      Editor.prototype.compiler = null;
+
+      
+      // @property {Boolean} Can be temporarily set to false while setting editor contents to indicate
+      //                     that the corresponding change event should be ignored (for save triggering).
+      Editor.prototype.changeEnabled = true;
+
+      return Editor;
+
+    }).call(this);
+    Utils.extend(Editor, module.config(), true, true);
+    return Editor;
+  });
+
+}).call(this);

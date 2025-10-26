@@ -1,0 +1,1130 @@
+(function() {
+  var $, SignalValue, Utils;
+
+  [$, Utils] = [];
+
+  SignalValue = (function() {
+    /*
+    This class is used to access the values of signals in a (currently VCD format) trace. It represents a
+    signal at a cycle.
+
+    This class provides methods for:
+    - transitioning to different cycles
+    - getting the value of the signal at the current cycle in various formats (`as*` methods)
+
+    Redwood EDA, LLC's Visual Debug feature supports special syntax for accessing TL-Verilog
+    "pipesignal" values (e.g. `'$sig'`) that produces a {SignalValue} object. TL-Verilog models are
+    "timing abstract", and Visual Debug visualizations should be timing abstract as well, to the
+    extent possible. To construct timing-abstract visualizations, it is important to consider
+    the following:
+    - Cycle numbers must be used only in a relative sense and not between different signals. The
+    current cycle number depends on the pipestage in which the signal was assigned and is thus not timing
+    abstract.
+    - The beginning and end of the trace require careful consideration, as they also reflect absolute time
+    and are not timing abstract. Traces may not contain the data one would wish to represent at the end
+    of the trace, and it may be valuable to illustrate this visually.
+
+    Though "cycle" values can be phase-granular (i.e. cycle x.5), the circuit is generally assumed to be
+    flip-flop-base (no latches) and synchronous to a single clock.
+
+    The term "transition" refers to a value or validity change from one cycle to the next (regardless of
+    glitches)
+    */
+    // @exclude
+    /*
+    TODO: Cycle number is relative to the signal in the trace. This should not be exposed to the user as it is
+    not timing-abstract. We should expose a cycle number that is reflective of the phase of the \viz block in which
+    this is declared, or extend this class with another that does.
+    TODO: Add caching of signal values. Add a class for a signal value (not associated with wave, and static),
+    cached in different formats. Change transactions to point to signal values. Keep a structure of all active
+    values with one object per value. For each new value in the trace, lookup this structure and allocate
+    if miss. Not sure whether value should include valid.
+    */
+    // @include
+    class SignalValue {
+      static staticInit(TSW, TF) {
+        SignalValue.TIME_SLOT_WIDTH = TSW;
+        return SignalValue.TRANSITION_FIELDS = TF;
+      }
+
+      /*
+      @param {Variable} signal the signal for this SignalValue
+      @param {Number} cyc the starting cycle for this SignalValue
+      */
+      constructor(signal, cyc1) {
+        this.signal = signal;
+        this.cyc = cyc1;
+        this.transitions = this.signal.transitions;
+        this.jumpTo(this.cyc);
+      }
+
+      /*
+      A static method to set the title (popup) for a signal value.
+      @param {String} value the value's type.
+      @param {String} value the binary string for the value, or real value string for type == "real".
+      @param {Number} bitwidth the bitwidth of the signal.
+      @param {Boolean} valid whether the value is valid.
+      @param {Number} space the available character width within which to represent the value.
+      @param {Boolean} needTitle false if title will not be used.
+      @return {[String, String]} the text and title to display.
+      */
+      static representValue(type, value, bitwidth, valid, space, needTitle = true) {
+        var clean, dec, hex, text, title;
+        if (type === "real") {
+          text = this.shortenReal(value, space);
+          title = `Real: ${value}`;
+        }
+        if (type === "string") {
+          text = this.shortenText(this.asString(value), space);
+          title = `String: ${value}`;
+        } else {
+          hex = valToHex(value, bitwidth);
+          if (bitwidth <= 3) {
+            text = hex;
+            title = hex;
+          } else {
+            text = this.shortenText(hex, space);
+            title = `${bitwidth}` + (bitwidth > 8 ? `'h${hex}` : `'b${value}`);
+            if (bitwidth <= 32 && needTitle) {
+              // Wide values are useless to represent in decimal and conversion only handles 32-bit signed values.
+              clean = value.indexOf("x") === -1 && value.indexOf("z") === -1;
+              if (clean) {
+                dec = parseInt(value, 2).toString(10);
+                title += `\n${bitwidth}'d${dec}`;
+              }
+            }
+          }
+        }
+        return [text, title];
+      }
+
+      /*
+      Does this signal exist.
+      @return false for the non-existent sentinal SignalValue only.
+      */
+      exists() {
+        return this.signal.exists();
+      }
+
+      /*
+      The signal must exist, or a {NonExistentSignalError} is thrown.
+      */
+      mustExist() {
+        if (!this.exists()) {
+          throw new SignalValue.NonExistentSignalError("Signal is missing from trace.");
+        }
+      }
+
+      // @include
+      /*
+      Get the value string at current time.
+      @return {String} value string
+      */
+      getValueStr() {
+        return this.transitions[this.transIndex + 1];
+      }
+
+      /*
+      Is this signal valid (according to when conditions) at the current time.
+      */
+      isValid() {
+        return this.transitions[this.transIndex + 2];
+      }
+
+      // @exclude
+      getLegacyValue() {
+        var ret;
+        ret = this.getValueStr();
+        if (!this.isValid()) {
+          ret = "W" + ret;
+        }
+        return ret;
+      }
+
+      getPrevTransitionLegacyValue() {
+        var ret;
+        ret = this.getPrevTransitionValueStr();
+        if (typeof ret === "undefined") {
+          return void 0;
+        }
+        if (!this.isPrevTransitionValid()) {
+          ret = "W" + ret;
+        }
+        return ret;
+      }
+
+      getNextTransitionLegacyValue() {
+        var ret;
+        ret = this.getNextTransitionValueStr();
+        if (typeof ret === "undefined") {
+          return void 0;
+        }
+        if (!this.isNextTransitionValid()) {
+          ret = "W" + ret;
+        }
+        return ret;
+      }
+
+      offBegining() { // Spelled wrong.
+        return typeof this.cyc === "undefined" || this.cyc < this.signal.waveData.startCycle;
+      }
+
+      // @include
+      /*
+      Indicates whether the current cycle is off the end of the trace.
+
+      _Warning_: This method is not timing-abstract.
+      @return {Boolean} `true` if current cycle is off the end of the trace.
+      */
+      offEnd() {
+        return typeof this.cyc === "undefined" || this.cyc > this.signal.waveData.endCycle;
+      }
+
+      /*
+      Indicates whether the current cycle is off the beginning of the trace.
+
+      _Warning_: This method is not timing-abstract.
+      @return {Boolean} `true` if current cycle is off the beginning of the trace.
+      */
+      offBeginning() {
+        return typeof this.cyc === "undefined" || this.cyc < this.signal.waveData.startCycle;
+      }
+
+      /*
+      Indicates whether the current cycle is within the bounds of this trace.
+
+      _Warning_: This method is not timing-abstract.
+      @return {Boolean} true if current cycle is within (inclusive) the bounds of this trace.
+      */
+      inTrace() {
+        return typeof this.cyc !== "undefined" && this.cyc <= this.signal.waveData.endCycle && this.cyc >= this.signal.waveData.startCycle;
+      }
+
+      /*
+      Gets the cycle at which this signal transitioned to its current value.
+
+      Note: This method is not timing-abstract at the beginning of the trace. (Reset may create predictability.)
+      @return {Number} the previous transition cycle
+      */
+      getTransitionCycle() {
+        return this.transitions[this.transIndex];
+      }
+
+      /*
+      Gets the next value string (as in the VCD file) of this signal after its next transition.
+
+      Note: This method is not timing-abstract at the end of the trace.
+      @return {String, undefined} the next value
+      */
+      getNextTransitionValueStr() {
+        return this.transitions[this.transIndex + SignalValue.TRANSITION_FIELDS + 1];
+      }
+
+      /*
+      Gets the cycle of the next transition of this signal.
+
+      Note: This method is not timing-abstract at the end of the trace.
+      @return {Number} the cycle of the next transition
+      */
+      getNextTransitionCycle() {
+        return this.transitions[this.transIndex + SignalValue.TRANSITION_FIELDS];
+      }
+
+      /*
+      Gets the value string (as in VCD) of this signal before it transitioned to its current value/validity.
+
+      Note: This method is not timing-abstract at the beginning of the trace. (Reset may create predictability.)
+      @return {String, undefined} the previous value string
+      */
+      getPrevTransitionValueStr() {
+        return this.transitions[this.transIndex - SignalValue.TRANSITION_FIELDS + 1];
+      }
+
+      /*
+      Gets the validity of this signal before it transitioned to its current value/validity.
+
+      Note: This method is not timing-abstract at the beginning of the trace. (Reset may create predictability.)
+      @return {Boolean, undefined} the previous validity
+      */
+      isPrevTransitionValid() {
+        return this.transitions[this.transIndex - SignalValue.TRANSITION_FIELDS + 2];
+      }
+
+      /*
+      Gets the validity of this signal after its next transition.
+
+      Note: This method is not timing-abstract at the end of the trace.
+      @return {Boolean, undefined} the next validity
+      */
+      isNextTransitionValid() {
+        return this.transitions[this.transIndex + SignalValue.TRANSITION_FIELDS + 2];
+      }
+
+      /*
+      Gets the current cycle of this {SignalValue}.
+
+      _Warning_: This method is not timing-abstract.
+      @return {Number} the current cycle of this {SignalValue}
+      */
+      getCycle() {
+        return this.cyc;
+      }
+
+      // @exclude
+      /*
+      [Private method with public legacy.]
+      Step to the given cycle (forward or backward).
+      Same result as jumpToCycle(cycle), but it walks transitions, rather than jumping
+      through anchor points, so it is best for small deltas.
+      @param {int} cyc
+      @return @ (for chaining)
+      */
+      stepTo(cyc) {
+        var c, forward;
+        forward = cyc > this.cyc;
+        if (forward) {
+          while ((typeof (c = this.getNextTransitionCycle()) !== "undefined") && c <= cyc) {
+            this.transIndex += SignalValue.TRANSITION_FIELDS;
+          }
+        } else {
+          while (this.transIndex >= 0 && this.getTransitionCycle() > cyc) {
+            this.transIndex -= SignalValue.TRANSITION_FIELDS;
+          }
+        }
+        this.cyc = cyc;
+        return this;
+      }
+
+      // @include
+      /*
+      Step forward (positive) or backward (negative) the given number of transitions (value changes).
+      A step of 0 steps <= 0 cycles to the transition resulting in the current value.
+      @param {int} steps the number of transitions to step
+      @return {SignalValue} this {SignalValue} (for chaining)
+      */
+      stepTransition(steps = 1) {
+        this.transIndex += SignalValue.TRANSITION_FIELDS * steps;
+        this.cyc = this.getTransitionCycle();
+        return this;
+      }
+
+      /*
+      Go to the given cycle.
+
+      _Warning_: This method is not timing-abstract.
+      @param {int} cyc the cycle to go to.
+      @return {SignalValue} this object (for chaining)
+      */
+      goTo(cyc) {
+        if (typeof this.transitions[this.transIndex] === "undefined" || Math.abs(cyc - this.cyc) > this.TIME_SLOT_WIDTH) {
+          this.jumpTo(cyc);
+        } else {
+          this.stepTo(cyc);
+        }
+        return this;
+      }
+
+      /*
+      Go to the beginning of the trace.
+
+      _Warning_: This method is not timing-abstract.
+      @return {SignalValue} this object (for chaining)
+      */
+      goToSimStart() {
+        this.goTo(this.signal.waveData.startCycle);
+        return this;
+      }
+
+      /*
+      Go to the beginning of the trace.
+
+      _Warning_: This method is not timing-abstract.
+      @return {SignalValue} this object (for chaining)
+      */
+      goToSimEnd() {
+        this.goTo(this.signal.waveData.endCycle);
+        return this;
+      }
+
+      /*
+      Increment the current cycle by the given amount (positive or negative).
+      @param {int} cyc
+      @return {SignalValue} this object (for chaining)
+      */
+      step(cyc = 1) {
+        return this.goTo(this.cyc + cyc);
+      }
+
+      /*
+      Step forward at least one cycle until the signal's value asInt is the given value
+      or the end of the trace is reached (stopping offEnd).
+
+      Note: This method is not timing-abstract at the end of the trace.
+      @param {int} val the signal value to step to
+      @return {boolean} true on success
+      */
+      forwardToValue(val) {
+        this.step();
+        while (!this.offEnd()) {
+          if (this.asInt() === val) {
+            return true;
+          }
+          this.stepTransition();
+        }
+        return false;
+      }
+
+      /*
+      Step backward at least one cycle until the signal's `asInt()` value is the given value
+      or the beginning of the trace is reached (stopping with `offBeginning() == true`).
+
+      Note: This method is not timing-abstract at the beginning of the trace.
+      @param {int} val the signal value to step to
+      @return {boolean} true on success
+      */
+      backToValue(val) {
+        this.step(-1);
+        while (!this.offBegining()) {
+          if (this.asInt() === val) {
+            return true;
+          }
+          this.stepTransition(0);
+          this.step(-1);
+        }
+        return false;
+      }
+
+      // @exclude
+
+        // Legacy methods:
+      goToNextValue() {
+        return this.goToNextTransition();
+      }
+
+      goToPrevValue() {
+        return this.goToPrevTransition();
+      }
+
+      nextCycle() {
+        return this.goToNextCycle();
+      }
+
+      prevCycle() {
+        return this.goToNextCycle();
+      }
+
+      asFixed(places, def) {
+        return this.asRealFixed(places, def);
+      }
+
+      stepByCyc(cyc) {
+        return this.step(cyc);
+      }
+
+      goToNextTransition() {
+        return this.stepTransition(1);
+      }
+
+      goToPrevTransition() {
+        return this.stepTransition(-1);
+      }
+
+      _asSomething(def, XZ, map) {
+        var valStr;
+        if (!this.inTrace()) {
+          return def;
+        }
+        if (!this.exists()) {
+          if (def === void 0) {
+            throw new SignalValue.NonExistentSignalError("Cannot return the value of a signal that is missing from trace.");
+          } else {
+            return def;
+          }
+        }
+        valStr = this.getValueStr();
+        if (XZ !== SignalValue.XZ_OK && /[^01]/.test(valStr)) {
+          return XZ;
+        }
+        // Value exists. Map it.
+        return map(valStr);
+      }
+
+      
+        // @include
+      /*
+      Get the signal value as a binary string with leading zeros.
+      @param {Any} def the value to return if outside the bounds of the trace; `undefined` by default
+      @return {String} the signal value as a string of binary bits, of def.
+      */
+      asBinaryStr(def) {
+        return this._asSomething(def, SignalValue.XZ_OK, function(valStr) {
+          return valStr;
+        });
+      }
+
+      /*
+      Get the signal value as a string of hexadecimal digits, w/ X for digits with all non-0/1 bits and x for
+      digits with any non 0/1 bits.
+      @param {String} leadingZeroStr the string to include for each leading zero, such as ("0", " ", or "").
+      @param {Any} def the value to return if outside the bounds of the trace; undefined by default
+      @return {String} the hexadecimal string
+      */
+      asHexStr(leadingZeroStr = "0", def = void 0) {
+        return this._asSomething(def, SignalValue.XZ_OK, function(valStr) {
+          var b, bit, digitVal, j, ret, v, xCnt;
+          ret = "";
+          bit = 0;
+          while (bit < valStr.length) {
+            digitVal = 0;
+            xCnt = 0;
+            for (b = j = 0; j <= 3; b = ++j) {
+              v = valStr[valStr.length - 1 - bit];
+              if (v === "1") {
+                digitVal += 1 << b;
+              } else if ((v !== "0") && (v !== void 0)) {
+                xCnt++;
+              }
+              bit++;
+            }
+            ret = (xCnt === 0 ? digitVal.toString(16) : (xCnt < 4 ? "x" : "X")) + ret;
+            if (leadingZeroStr !== "0") {
+              while (ret[ret.length - 1] === "0" && ret.length > 1) {
+                ret = ret.substring(1);
+              }
+            }
+          }
+          return ret;
+        });
+      }
+
+      /*
+      Get the signal value as a color string.
+      @param {Any} def the value to return if outside the bounds of the trace; undefined by default
+      @throw {SignalValue.TypeError} if the signal is not 24, 32, 12, or 16 bits
+      @return {String} the color string
+      */
+      asColor(def = void 0) {
+        var ref;
+        if (!((ref = this.signal.width) === 24 || ref === 32 || ref === 12 || ref === 16)) {
+          throw new SignalValue.TypeError(`Signal ${this.signal.fullName} accessed as color has a width of ${this.signal.width} bit, not 24, 32, 12, or 16.`);
+        }
+        return `#${this.asHexStr("0", def)}`;
+      }
+
+      /*
+      Get the signal value as a decimal string.
+      - Handles very large values safely.
+      - Handles signed/unsigned interpretation.
+      @param {String} leadingZeroStr the padding character (e.g. " " or "0") for fixed-width output or "" for no padding; " " is used to pad the sign character for positive signed values; default: "".
+      @param {Boolean} signed whether to treat the leading bit as sign bit (two's complement); default: false.
+      @param {Any} def the value to return if outside the bounds of the trace or if the value contains x/z; default: undefined
+      @return {String} the decimal string representing the signal value or def
+      */
+      asIntStr(leadingZeroStr = "", signed = false, def = void 0) {
+        return this._asSomething(def, def, (valStr) => {
+          var maxDigits, maxUnsigned, negative, str, useBigInt, val, width;
+          // Characterize the value, treating sign and magnitude separately.
+          width = this.signal.width;
+          negative = false;
+          if (signed && width > 0) {
+            negative = valStr[0] === "1";
+            valStr = valStr.substring(1);
+            width = width - 1;
+          }
+          useBigInt = width > 53;
+          // Parse value (magnitude bits)
+          if (useBigInt) {
+            val = BigInt("0b" + valStr);
+            if (negative) {
+              // Two's complement
+              val = val - (BigInt(1) << BigInt(width));
+            }
+          } else {
+            val = parseInt(valStr, 2);
+            if (negative) {
+              // Two's complement
+              val = val - (1 << width);
+            }
+          }
+          // Convert to decimal magnitude string
+          str = val.toString(10);
+          // Handle leading zero/space padding
+          if (leadingZeroStr !== "" && (width != null)) {
+            if (useBigInt) {
+              maxUnsigned = (BigInt(1) << BigInt(width)) - BigInt(1);
+              maxDigits = maxUnsigned.toString(10).length;
+            } else {
+              maxUnsigned = Math.pow(2, width) - 1;
+              maxDigits = Math.floor(Math.log10(maxUnsigned)) + 1;
+            }
+            str = leadingZeroStr.repeat(Math.max(0, maxDigits - str.length)) + str;
+            if (signed) {
+              if (negative) {
+                str = "-" + str;
+              } else {
+                if (leadingZeroStr !== "") {
+                  str = " " + str;
+                }
+              }
+            }
+          }
+          return str;
+        });
+      }
+
+      /*
+      Get the signal value interpreted as a SystemVerilog string type.
+      @param {Any} def the value to return if outside the bounds of the trace; undefined by default
+      @return {String} the value of the signal interpreted as a SystemVerilog string.
+      */
+      asString(def) {
+        return this._asSomething(def, SignalValue.XZ_OK, (binaryStr) => {
+          var ch, charBinaryStr, len, ret;
+          if ((this.signal.width % 8) !== 0) {
+            return def;
+          }
+          len = this.signal.width / 8;
+          ret = "";
+          ch = 0;
+          while (ch < len) {
+            charBinaryStr = binaryStr.substring(ch * 8, (ch + 1) * 8);
+            ret += String.fromCharCode(parseInt(charBinaryStr, 2));
+            ch++;
+          }
+          return ret;
+        });
+      }
+
+      /*
+      Get the signal value as a boolean, or null if dont-care or not a single bit.
+      @param {Any} def the value to return if outside the bounds of the trace or if the value contains x/z; undefined by default
+      @return {Boolean} the signal value as a boolean or def
+      @throw {SignalValue.TypeError} if the signal is not a single bit
+      */
+      asBool(def) {
+        // TODO: width should be a Number, not a string.
+        if (this.signal.width !== 1) {
+          throw new SignalValue.TypeError(`Signal ${this.signal.fullName} accessed as boolean has a width of ${this.signal.width} bit, not 1.`);
+        }
+        return this._asSomething(def, def, function(valStr) {
+          if (valStr === "0") {
+            return false;
+          } else if (valStr === "1") {
+            return true;
+          }
+        });
+      }
+
+      /*
+      Get the signal value as an integer Number.
+      - Returns NaN if value contains x/z.
+      - Throws error if width > 53 bits.
+      @param {Any} def default value if not in trace
+      @return {Number} the integer value
+      @throw {SignalValue.TypeError} if the signal is wider than 53 bits
+      */
+      asInt(def) {
+        if (this.signal.width > 53) {
+          throw new SignalValue.TypeError("Signal width exceeds safe integer range (53 bits). Use asBigInt(..) instead.");
+        }
+        return this._asSomething(def, 0/0, function(valStr) {
+          return parseInt(valStr, 2);
+        });
+      }
+
+      /*
+      Get the signal value as a signed integer Number, interpreted the bits as a two's complement signed number.
+      - Returns NaN if value contains x/z.
+      - Throws error if width > 53 bits.
+      @param {Any} def default value if not in trace
+      @return {Number} the signed integer value
+      @throw {SignalValue.TypeError} if the signal is wider than 53 bits
+      */
+      asSignedInt(def) {
+        if (this.signal.width > 53) {
+          throw new SignalValue.TypeError("Signal width exceeds safe integer range (53 bits). Use asBigInt(..) instead.");
+        }
+        if (this.signal.width <= 1) {
+          throw new SignalValue.TypeError(`Cannot interpret ${this.signal.width}-bit signal as signed.`);
+        }
+        return this._asSomething(def, 0/0, (valStr) => {
+          var negative, val, width;
+          // Characterize the value, treating sign and magnitude separately.
+          negative = valStr[0] === "1";
+          valStr = valStr.substring(1);
+          width = this.signal.width - 1;
+          // Parse value (magnitude bits)
+          val = parseInt(valStr, 2);
+          if (negative) {
+            // Two's complement
+            val = val - (1 << width);
+          }
+          return val;
+        });
+      }
+
+      /*
+      Get the signal value as a JavaScript BigInt.
+      - Returns NaN if value contains x/z.
+      @param {Any} def default value if not in trace
+      @return {BigInt} the integer value
+      */
+      asBigInt(def) {
+        return this._asSomething(def, def, function(valStr) {
+          return BigInt("0b" + valStr);
+        });
+      }
+
+      /*
+      Get the signal interpreted as an SV "real" or "shortreal" signal based on width.
+      @param {Any} def the value to return if outside the bounds of the trace; undefined by default
+      @return {Number} the value of the signal interpreted as an IEEE floating-point value or NaN if the value contains x/z.
+      @throw {SignalValue.TypeError} if the signal width is not 32 or 64 bits
+      */
+      asReal(def) {
+        var ref;
+        if ((ref = this.signal.width) !== 32 && ref !== 64) {
+          throw new SignalValue.TypeError(`Signal ${this.signal.fullName} accessed as real must be 32 or 64 bits, not ${this.signal.width}.`);
+        }
+        return this._asSomething(def, 0/0, (valStr) => {
+          return this._parseIEEE754(valStr, this.signal.width);
+        });
+      }
+
+      /*
+      Parse IEEE 754 floating-point binary string. There may be precision loss in the resulting value.
+      @param {String} valStr binary string representation
+      @param {Number} width bit width (32 or 64)
+      @return {Number} parsed floating-point value
+      @private
+      */
+      _parseIEEE754(valStr, width) {
+        var exp, expAllOnes, expAllZeros, expBias, expBits, expStr, frac, fracBits, fracStr, isDenormalized, result, signStr;
+        // IEEE 754 format parameters
+        if (width === 32) {
+          expBits = 8;
+          fracBits = 23;
+          expBias = 127; // width is 64
+        } else {
+          expBits = 11;
+          fracBits = 52;
+          expBias = 1023;
+        }
+        
+        // Extract components
+        signStr = valStr.substring(0, 1);
+        expStr = valStr.substring(1, 1 + expBits);
+        fracStr = valStr.substring(1 + expBits);
+        
+        // Validate bit string length
+        if (valStr.length !== width) {
+          throw new Error(`Binary string length ${valStr.length} doesn't match expected width ${width}`);
+        }
+        
+        // Parse exponent
+        expAllOnes = "1".repeat(expBits);
+        expAllZeros = "0".repeat(expBits);
+        
+        // Handle special cases: infinity and NaN
+        if (expStr === expAllOnes) {
+          if (/1/.test(fracStr)) {
+            return 0/0; // NaN (any non-zero fraction)
+          } else {
+            if (signStr === "1") {
+              return -2e308;
+            } else {
+              return 2e308; // Infinity
+            }
+          }
+        }
+        
+        // Handle normal and denormalized numbers
+        isDenormalized = expStr === expAllZeros;
+        if (isDenormalized) {
+          // Denormalized: exponent is 1 - bias, no implicit leading 1
+          exp = 1 - expBias;
+          // Note: JavaScript can lose precision for very small denormalized values
+          frac = parseInt(fracStr, 2);
+        } else {
+          // Normal: exponent is parsed value minus bias, implicit leading 1
+          exp = parseInt(expStr, 2) - expBias;
+          // Note: For very large exponents, this may exceed JavaScript's Number.MAX_VALUE
+          frac = parseInt("1" + fracStr, 2);
+        }
+        
+        // Calculate the final value
+        // Note: JavaScript uses 64-bit IEEE 754 internally, so:
+        // - 32-bit values are exactly representable
+        // - Some 64-bit values may lose precision due to JavaScript's limitations
+        // - Very large or very small values may become Infinity or 0
+        result = frac * Math.pow(2, exp - fracBits);
+        
+        // Apply sign
+        if (signStr === "1") {
+          result = -result;
+        }
+        return result;
+      }
+
+      /*
+      Get the 64-bit signal interpreted as an SV "real", rounded to a fixed
+      decimal place.
+      @param {int} places the number of decimal places
+      @param {Any} def the value to return if outside the bounds of the trace; undefined by default
+      @return {Number} the value of the signal interpreted as an IEEE 64-bit floating-point value, rounded to a fixed number of digits
+      @throw {SignalValue.TypeError} if the signal is not 64 bits
+      */
+      asRealFixed(places, def) {
+        if (this.signal.width !== 64) {
+          throw new SignalValue.TypeError(`Signal ${this.signal.fullName} accessed as real has a width of ${this.signal.width} bit, not 64.`);
+        }
+        return this.asReal(def).toFixed(places);
+      }
+
+      get v() {
+    if (this.signal.type === "real") {
+      throw new SignalValue.TypeError(
+        "Accessing .v on real signal " + this.signal.fullName + ". Use asReal() instead."
+      );
+    } else if (this.signal.type === "string") {
+      throw new SignalValue.TypeError(
+        "Accessing .v on string signal " + this.signal.fullName + ". Use asString() instead."
+      );
+    } else {
+      return this.asInt();
+    }
+    // Coercion functions.
+
+      // For public docs only:
+    // @exclude
+    /*
+     * @include
+     * @property {Number} v (read-only) A short-hand version of `asInt()`. Unlike `asInt()`, this throws a `SignalValue.TypeError` for signals of type `real` and `string` (as defined in the VCD file).
+    v: null
+     * @exclude
+     */
+    // @include
+    /*
+    Access the integer value of the signal directly.
+    - Throws if signal is real or string type.
+    (Our CoffeeScript doesn't support getter syntax.)
+    */
+  };
+
+      [Symbol.toPrimitive](hint) {
+    if (hint === "string") {
+      return this.toString()
+    } else {
+      return this.valueOf()
+    }
+    /*
+    Handle explicit primitive coercion for SignalValue.
+    (The CoffeeScript linter doesn't like this syntax as CoffeeScript.)
+    - Supports "string", "number", "default".
+    - Throws for any unknown hint.
+    */
+  };
+
+      /*
+      Return the string representation of the signal (as represented in the waveform viewer).
+      @param {int} space (opt) the available width within which to represent the value text.
+      @return {String} the string representation of the signal value
+      */
+      toString(space = 1000) {
+        var dummy, str;
+        [str, dummy] = SignalValue.representValue(this.signal.type, this.getValueStr(), this.signal.width, this.isValid(), space, false);
+        return str;
+      }
+
+      /*
+      Return the numeric value of the signal.
+      - For real signals: float.
+      - For integer signals: Number (or NaN if x/z).
+      @return {Number} the numeric value of the signal
+      @throw {SignalValue.TypeError} if the signal is a string type
+      */
+      valueOf() {
+        if (this.signal.type === "real") {
+          return this.asReal();
+        } else if (this.signal.type === "string") {
+          throw new SignalValue.TypeError(`Refusing to represent string signal ${this.signal.fullName} as a number.`);
+        } else {
+          return this.asInt();
+        }
+      }
+
+      // @exclude
+      /*
+      Jumps this SignalValue to the given cycle (via anchors array).
+      @param {int} cyc the cycle to jump the SignalValue to
+      @return @ for chaining
+      */
+      jumpTo(cyc) {
+        this.transIndex = this.signal.getTransIndexOfCycle(cyc);
+        this.cyc = cyc;
+        return this;
+      }
+
+      /*
+      A static method to shorten text to fit in bus section
+      @param {String} val the text representation of the bus value
+      @param {String} space the space for the text in characters
+      @return {String} the shortened text
+      */
+      static shortenText(val, space) {
+        if (val.length > space) {
+          if (space === 0) {
+            return "";
+          } else {
+            if (space === 1) {
+              return "*";
+            } else {
+              return "*" + val.substring(val.length - space + 1);
+            }
+          }
+        }
+        return val;
+      }
+
+      /*
+      A static method to shorten a Real value to fit in bus section.
+      @param {String} val the text representation of the bus value
+      @param {String} space the space for the text in characters
+      @return {String} the shortened text
+      */
+      static shortenReal(val, space) {
+        var float, minFloat, minLen;
+        if (val.length > space) {
+          float = parseFloat(val);
+          minFloat = float.toPrecision(1);
+          minLen = minFloat.length;
+          if (minLen > space) {
+            if (space === 0) {
+              return "";
+            } else {
+              if (space < 4) {
+                return "R";
+              } else {
+                return "Real";
+              }
+            }
+          }
+          return float.toPrecision(space - minLen + 1);
+        }
+        return val;
+      }
+
+    };
+
+    // @exclude
+
+    // @property {Variable} the signal for this SignalValue
+    SignalValue.prototype.signal = null;
+
+    // @property {Array} a shortcut to signal.transitions.
+    SignalValue.prototype.transitions = null;
+
+    // @property {Number} phase-granular cycle this SignalValue is currently at
+    SignalValue.prototype.cyc = -1;
+
+    // @property {int} transIndex the index into the transitions array of the cycle field
+    //                 defining the transition that assigns the current value.
+    SignalValue.prototype.transIndex = null;
+
+    // @property {int} the index of the current value within its chunk.
+    //_indexInChunk: -1
+    // @property {Number} TIME_SLOT_WIDTH constant for the granularity of the anchor array in cycles
+    //                    (should be same as WaveData)
+    SignalValue.TIME_SLOT_WIDTH = null;
+
+    SignalValue.TRANSITION_FIELDS = null;
+
+    // Methods to access the signal value in various representations.
+    // TODO: These should treat invalid as X for consistent behavior regardless of --xinj. Careful about backward compatibility.
+    //       Currently, since invalid values can impact behavior, we do not implement this so these values can be represented.
+
+    // For implementing as*(def) functions.
+    // @param def default value or undefined
+    // @param XZ the value to return if the value contains x/z or SignalValue.XZ_OK
+    // @param map function that maps the value string to the desired return type.
+    SignalValue.XZ_OK = "XZ_OK";
+
+    return SignalValue;
+
+  }).call(this);
+
+  /*
+  Converts a binary value to hex.
+  @param {String} val the binary value
+  @param {Number} width the bitwidth of the signal
+  @return {String} the value as a hex string
+  */
+  this.valToHex = function(val, width) {
+    var bytes, c, j, maxBytes, out, ref, temp;
+    val = "" + val;
+    out = valToHexChunks(val);
+    out = valToHexRemainder(val, out);
+    if (width > val.length) {
+      temp = null;
+      if (val[0] === "z") {
+        temp = "Z";
+      } else {
+        if (val[0] === "x") {
+          temp = "X";
+        }
+      }
+      if (temp) {
+        maxBytes = Math.ceil(width / 4);
+        bytes = Math.ceil(val.length / 4);
+        for (c = j = 0, ref = maxBytes - bytes; (0 <= ref ? j < ref : j > ref); c = 0 <= ref ? ++j : --j) {
+          out = appendHexChunk(out, temp);
+        }
+      }
+    }
+    return out.split("").reverse().join("");
+  };
+
+  /*
+  converts binary value to hex in four bit chunks (does not get tail)
+  @param {String} val the value to convert to hex
+  @return {String} the hex string (tail not converted)
+  */
+  this.valToHexChunks = function(val) {
+    var arr, chunk, hex, i, index, j, len1, out;
+    out = "";
+    arr = [];
+    index = val.length - 4;
+    while (index >= 0) {
+      arr.push(index);
+      index -= 4;
+    }
+    for (j = 0, len1 = arr.length; j < len1; j++) {
+      i = arr[j];
+      chunk = val.substr(i, 4);
+      if (chunk === "xxxx") {
+        hex = "X";
+      } else {
+        if (chunk === "zzzz") {
+          hex = "Z";
+        } else {
+          if (chunk.indexOf("x") >= 0) {
+            hex = "x";
+          } else {
+            if (chunk.indexOf("z") >= 0) {
+              hex = "z";
+            } else {
+              hex = parseInt(chunk, 2).toString(16);
+            }
+          }
+        }
+      }
+      out = appendHexChunk(out, hex);
+    }
+    return out;
+  };
+
+  /*
+  converts the tail of a binary number to hex
+  @param {String} val the partially converted hex string
+  @param {String} front the first part of the output hex string
+  @return {String} the whole number in hex
+  */
+  this.valToHexRemainder = function(val, front) {
+    var hex, small;
+    if (val.length % 4) {
+      small = val.substr(0, val.length % 4);
+      if (small === "x" || small === "xx" || small === "xxx") {
+        hex = "X";
+      } else {
+        if (small === "z" || small === "zz" || small === "zzz") {
+          hex = "Z";
+        } else {
+          if (small.indexOf("x") >= 0) {
+            hex = "x";
+          } else {
+            if (small.indexOf("z") >= 0) {
+              hex = "z";
+            } else {
+              hex = parseInt(small, 2);
+            }
+          }
+        }
+      }
+      front = appendHexChunk(front, hex);
+    }
+    return front;
+  };
+
+  /*
+  converts to a binary string
+  @param {String} val the number to convert
+  @param {Number} width the bitwidth of the signal
+  @return {String} the binary value with x's and z's added as needed
+  */
+  this.valToBin = function(val, width) {
+    var c, j, more, na, ref, space;
+    if (width > val.length) {
+      na = null;
+      if (val[0] === "z") {
+        na = "z";
+      } else {
+        if (val[0] === "x") {
+          na = "x";
+        }
+      }
+      if (na) {
+        more = "";
+        space = width - val.length;
+        for (c = j = 0, ref = space; (0 <= ref ? j < ref : j > ref); c = 0 <= ref ? ++j : --j) {
+          more += na;
+        }
+        return more + val;
+      }
+    }
+    return val;
+  };
+
+  /*
+  puts together hex chunks with underscore if necessary
+  @param {String} large the main string of the hex value
+  @param {String} next the chunk to append
+  @return {String} next appended to large, with underscore if necessary
+  */
+  this.appendHexChunk = function(large, next) {
+    if (large.length !== 4 && ((large.length + 1) % 5)) {
+      return large += next;
+    }
+    return large += "_" + next;
+  };
+
+  // @include
+  /*
+  An Error thrown when a value is accessed from a non-existent signal.
+  */
+  SignalValue.NonExistentSignalError = class NonExistentSignalError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "NonExistentSignalError";
+    }
+
+  };
+
+  /*
+  An Error thrown when a value is accessed from a signal as an incompatible type.
+  */
+  SignalValue.TypeError = class TypeError extends Error {
+    constructor(msg) {
+      super(msg);
+      this.name = "TypeError";
+    }
+
+  };
+
+  define(function(require, exports, module) {
+    $ = require("jquery");
+    Utils = require("Utils");
+    $.extend(SignalValue.prototype, module.config());
+    return SignalValue;
+  });
+
+}).call(this);

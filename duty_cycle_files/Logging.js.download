@@ -1,0 +1,355 @@
+(function() {
+
+  /*
+  A module that handles logging events.
+
+  @extend ModuleConfigObject
+  */
+  var $, Logging, Promise;
+
+  [$, Promise] = [];
+
+  if (typeof window === "undefined") {
+    $ = {
+      extend: require("extend")
+    };
+  }
+
+  if (typeof window === "undefined") {
+    Promise = require("bluebird");
+  }
+
+  Logging = (function() {
+    class Logging {
+      /*
+      Creates a new log item marked as a critical error.  Database initialization error,
+      process aborted.
+      @param {String} devMsg a message that would be useful for developers
+      @return Logging
+      */
+      static FATAL(devMsg) {
+        return new Logging("fatal").user(devMsg);
+      }
+
+      /*
+      Creates a new log item marked as an infrastructure error.
+      Non critical server-side connection failures (connection to `static.support.rweda.com`, connection to a compilation
+      server), database insertion/query error.
+      @param {String} devMsg a message that would be useful for developers
+      @return Logging
+      */
+      static ERROR(devMsg) {
+        return new Logging("error").user(devMsg);
+      }
+
+      /*
+      Creates a new log item for user-side fatal issues.
+      Permission error, login request connection failure.
+      @param {String} usrMsg a message that can be given to the user.
+      @return Logging
+      */
+      static WARN(usrMsg) {
+        return new Logging("warn").user(usrMsg);
+      }
+
+      /*
+      Creates a new log item describing a state change.
+      User registration, project creation/clone.  Project path change.
+      @param {String} devMsg a message that would be useful for developers
+      @return Logging
+      */
+      static INFO(devMsg) {
+        return new Logging("info").dev(devMsg);
+      }
+
+      /*
+      Creates a new log item describing a user-side recoverable error.  Compilation timeout,
+      syntax issue detected by SandPiper.
+      @param {String} usrMsg a message that can be given to the user.
+      @return Logging
+      */
+      static USER(usrMsg) {
+        return new Logging("user").user(usrMsg);
+      }
+
+      /*
+      Creates a new log item for transaction tracing.
+      Compilation start/end, file edit, user login, anonymous login.
+      @param {String} breakpoint a unique identifier for the logged message.
+      @return Logging
+      */
+      static DETAIL(breakpoint) {
+        return new Logging("detail").add({breakpoint});
+      }
+
+      /*
+      Create a new log item for debug purposes, that isn't transmitted to the server by default.
+      permission checks, URL access.
+      By default, `DEBUG` messages are ignored by {ErrorLog}.  At runtime, individual `DEBUG` messages can be enabled via
+      `/errlog/`.
+      @param {String} breakpoint a unique identifier for the logged message.
+      @param {String} devMsg a message that would be useful for developers
+      @return Logging
+      */
+      static DEBUG(breakpoint, devMsg) {
+        return new Logging("debug").dev(devMsg).add({breakpoint});
+      }
+
+      constructor(severity) {
+        this.severity = severity;
+        this.data = {};
+        this.time = Date.now();
+        this.add({severity: this.severity, time: this.time});
+      }
+
+      /*
+      Stores a message that can be told to the user.
+      @param {String} usrMsg a message to tell the user
+      @return Logging
+      */
+      user(usrMsg1) {
+        this.usrMsg = usrMsg1;
+        return this.add({usrMsg: this.usrMsg});
+      }
+
+      /*
+      Stores a message that would be useful for developers.
+      @param {String} devMsg a message for developers
+      @return Logging
+      */
+      dev(devMsg1) {
+        this.devMsg = devMsg1;
+        return this.add({devMsg: this.devMsg});
+      }
+
+      /*
+      Stores a user's unique identification to track in logs.
+      @param {String} userID user's identification code
+      @return Logging
+      */
+      uid(userID) {
+        this.userID = userID;
+        return this.add({userID: this.userID});
+      }
+
+      /*
+      Stores a package and method name to ease finding the source of a method.
+      @param {String} package the name of the executing package
+      @param {String} method the name of the executing method
+      @return Logging
+      */
+      loc(_package, method) {
+        this.package = _package;
+        this.method = method;
+        return this.add({package: this.package, method: this.method});
+      }
+
+      /*
+      Stores an error object.
+      @param {Error} err the error to store
+      @return Logging
+      */
+      err(err) {
+        this.err = err;
+        this.errString = this.err.toString();
+        this.errStack = this.err.stack;
+        return this.add({err: this.err, errString: this.errString, errStack: this.errStack});
+      }
+
+      /*
+      Stores the number of retry attempts that were made.
+      @param {int} retryCount
+      @return Logging
+      */
+      attempts(retryCount) {
+        this.retryCount = retryCount;
+        return this.add({retryCount: this.retryCount});
+      }
+
+      /*
+      Stores a method to use when retrying the action being logged.
+      @param {Function} retryCB a function to retry
+      @return Logging
+      */
+      retry(retryCB) {
+        this.retryCB = retryCB;
+        return this.add({
+          retryCB: this.retryCB.toString()
+        });
+      }
+
+      retryPromise() {
+        var _retryCB, ref;
+        _retryCB = (ref = this.retryCB) != null ? ref : function() {
+          return true;
+        };
+        return new Promise((resolve, reject) => {
+          return this.retryCB(function() {
+            _retryCB();
+            return resolve();
+          });
+        });
+      }
+
+      /*
+      Displays the current message to the user via the interface given, .
+      @param {ErrorDisplay} display a location to display a message to the user
+      @return Logging
+      */
+      display(display) {
+        display.show(this);
+        return this;
+      }
+
+      /*
+      Sends the current error log to SandHost.
+      Can only be run on the client.
+      @return Logging
+      */
+      send() {
+        console.log(this.data);
+        $.post(window.appApiUrl("/error/"), this.data);
+        return this;
+      }
+
+      /*
+      Set the HTTP status code to send the client, or return the current status to send the client.
+      @overload httpStatus(status)
+        Set the HTTP status code to send to the client.
+        @param {Integer} status the HTTP status code to send
+        @return {Logging} for chaining
+      @overload httpStatus()
+        Get the HTTP status code to send to the client.  If a user has specified a code, that will be returned.  Otherwise,
+        an appropriate code is guessed based on the severity of this message.
+        @return {Number} the status code to send the user
+      */
+      httpStatus(status) {
+        if (status) {
+          this._httpStatus = status;
+          return this;
+        }
+        if (this._httpStatus) {
+          return this._httpStatus;
+        }
+        switch (this.severity) {
+          case "fatal":
+            return 503;
+          case "error":
+            return 500;
+          case "warn":
+            return 400;
+          case "user":
+            return 422;
+          default:
+            return 200;
+        }
+      }
+
+      /*
+      Handles responding to the client, when operating through a Connect request.
+      Can only be run on the server.
+      @param {Express.request} req the request given by the client
+      @param {Express.response} res the response to give the client
+      @return Logging
+      */
+      connect(req, res) {
+        res.status(this.httpStatus());
+        if (this.usrMsg) {
+          res.send(`Error while ${this.usrMsg}`);
+        }
+        if (!this.usrMsg) {
+          res.send("Server-side error.");
+        }
+        return this;
+      }
+
+      /*
+      Handles responding to the client via JSON, when operating through a Connect request.
+      Can only be run on the server.
+      @param {Express.request} req the request given by the client
+      @param {Express.response} res the response to give the client
+      @return Logging
+      */
+      json(req, res) {
+        res.status(this.httpStatus());
+        if (this.usrMsg) {
+          res.json({
+            err: this.usrMsg
+          });
+        }
+        if (!this.usrMsg) {
+          res.json({
+            err: "Server-side error."
+          });
+        }
+        return this;
+      }
+
+      /*
+      Hands this message directly to an {ErrorLog}.
+      Can only be run on the server.
+      @param {ErrorLog} log the log to store this message in
+      @return Logging
+      */
+      log(log) {
+        // I've seen fatal errors that message was not a function, so I added this check to avoid a crash.
+        if ((log.message != null) && typeof log.message === "function") {
+          log.message(this.data);
+        } else {
+          console.log(`Bug: log.message not a function. Dumping log:\n${log}`);
+        }
+        return this;
+      }
+
+      /*
+      Stores a value in the data associated with the log.
+      @overload add(vals)
+        @param {Object} vals a set of key/value pairs to add to the data
+        @return Logging
+      @overload add(key, val)
+        @param {String} key a key to store a value under
+        @param {Anything} val the data to store
+        @return Logging
+      */
+      add(k, v) {
+        if (!v) {
+          $.extend(this.data, k);
+        } else {
+          this.data[k] = v;
+        }
+        return this;
+      }
+
+    };
+
+    // @property {String} a basic level of message
+    Logging.prototype.severity = null;
+
+    // @property {int} the time a message was created (Date.now() format)
+    Logging.prototype.time = null;
+
+    // @property {Object} all keys associated with this log message
+    Logging.prototype.data = null;
+
+    // @property {Integer} a custom HTTP Status Code to send for this message
+    Logging.prototype._httpStatus = null;
+
+    return Logging;
+
+  }).call(this);
+
+  if (typeof window === "undefined") {
+    module.exports = Logging;
+  } else {
+    define("Logging", function(require, exports, module) {
+      $ = require("jquery");
+      Promise = require("bluebird");
+      //Utils = require "Utils"
+
+      //Utils.extend(Logging, module.config())
+      $.extend(Logging.prototype, module.config());
+      return Logging;
+    });
+  }
+
+}).call(this);

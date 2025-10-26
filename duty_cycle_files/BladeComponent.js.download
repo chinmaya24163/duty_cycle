@@ -1,0 +1,68 @@
+(function() {
+  define("BladeComponent", function(require, extend, module) {
+    /*
+    A mixin for classes with associated blade.
+
+    @mixin
+    @see https://github.com/bminer/node-blade
+    */
+    var $, BladeComponent, Promise, blade;
+    $ = require("jquery");
+    Promise = require("bluebird");
+    blade = require("blade");
+    BladeComponent = {
+      // @property [String] The ID that the contents of this component should be inserted into.
+      path: null,
+      /*
+      A static method to render Blade to an element (without adding it to the DOM).
+      The Blade is rendered with:
+        - appConfig: window.appConfig or not defined -
+                     the "app" property of the configuration object
+        - basePath: window.appApiUrl("") or not defined -
+                     the base path (absolute or relative) of the app for API and URLs.
+        - componentName: the name of the component from the parameter.
+      @param {String} name The filename of the template (without `.blade`)
+      @param {Object} options options for the blade template
+      @return {Promise} Promise resolving to the callback return value.
+      */
+      compileComponent: function(name, options) {
+        blade.Runtime.options.mount = this.blade;
+        // Default timeout is 15 sec. We saw timeouts in stress testing.
+        blade.Runtime.options.loadTimeout = 60000;
+        // Provide componentName to Blade code.
+        options.componentName = name;
+        return new Promise(function(resolve, reject) {
+          return blade.Runtime.loadTemplate(`${name}.blade`, function(err, tmpl) {
+            if (err) {
+              reject(err);
+              return;
+            }
+            // Add app config to options (done here so they can load in parallel with tmpl).
+            if (window.appConfig) {
+              options.appConfig = window.appConfig;
+            }
+            if (window.appApiUrl) {
+              options.basePath = window.appApiUrl("");
+            }
+            return tmpl(options, function(err, html) {
+              if (err) {
+                reject(err);
+                return;
+              }
+              return resolve(html);
+            });
+          });
+        });
+      },
+      /*
+      Assigns ids to sub-elements by including the path name to ensure all elements have a unique ID.
+      @param {String} name The name of the sub-element to include in the ID.
+      */
+      childPath: function(name) {
+        return `${this.path}-${name}`;
+      }
+    };
+    return BladeComponent;
+  });
+
+}).call(this);

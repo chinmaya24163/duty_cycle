@@ -1,0 +1,262 @@
+(function() {
+  define("ScrollWrapper", function(require, exports, module) {
+    /*
+    A component for the simulation scroll controls that can be used across multiple panes.
+
+    @extend BladeComponent
+    @extend ModuleConfigObject
+    */
+    var $, BladeComponent, ScrollWrapper, Utils;
+    BladeComponent = require("BladeComponent");
+    $ = require("jquery");
+    Utils = require("Utils");
+    ScrollWrapper = (function() {
+      class ScrollWrapper {
+        // Initialize the ScrollWrapper
+        // @param {Pane} pane The parent pane
+        // @param {Object} options Additional options
+        // @return {Promise} A promise that resolves to this ScrollWrapper instance
+        init(pane, options = {}) {
+          this.pane = pane;
+          this.path = "ScrollWrapper"; // Make sure this path matches your file structure
+          options["path"] = this.path;
+          return this.compileComponent(this.path, options).then((html) => {
+            this.el = $(html);
+            this.pane.paneEl.append(this.el);
+            this.setupEventHandlers();
+            if (options.alwaysLive) {
+              this.pane.goLive();
+              Utils.$one(".go-live-btn", this.pane.paneEl).hide();
+            } else {
+              this.setupGoLiveButton();
+            }
+            return this;
+          }).catch(function(err) {
+            return console.error("Error initializing ScrollWrapper:", err);
+          });
+        }
+
+        /*
+        Sets up the go live button functionality
+        */
+        setupGoLiveButton() {
+          Utils.assert(this.pane.paneEl);
+          Utils.$one(".scroll-wrapper", this.el).hide();
+          return Utils.$one(".go-live-btn", this.pane.paneEl).off("click").on("click", () => {
+            if (this.pane.isLive) {
+              this.pane.goDead();
+              return this.hide();
+            } else {
+              this.show();
+              return this.pane.goLive();
+            }
+          });
+        }
+
+        /*
+        Sets up all event handlers for the scroll wrapper controls
+        */
+        setupEventHandlers() {
+          var dropdownMenu, keyboardNavigation, keycode, scrollWrapper, slider;
+          scrollWrapper = this.el;
+          slider = Utils.$one(".scroll-bar", scrollWrapper);
+          slider.on("mouseenter mouseleave mouseover mouseout mouseup input", function(e) {
+            return e.stopPropagation();
+          });
+          // Adding mouse events as fallback for Safari compatibility
+          slider.on("mousedown", (e) => {
+            if (e.target.setPointerCapture && e.pointerId) {
+              return e.target.setPointerCapture(e.pointerId);
+            }
+          });
+          slider.on("mouseup mouseleave", (e) => {
+            if (e.target.hasPointerCapture && e.pointerId && e.target.hasPointerCapture(e.pointerId)) {
+              return e.target.releasePointerCapture(e.pointerId);
+            }
+          });
+          slider.on("input", (e) => {
+            var newCyc;
+            newCyc = parseInt(e.target.value);
+            return this.pane.setCycle(newCyc);
+          });
+          
+          // Set up step forward/backward buttons
+          Utils.$one("[data-step='forward']", scrollWrapper).click((e) => {
+            e.preventDefault();
+            return this.pane.nextCycle();
+          });
+          Utils.$one("[data-step='back']", scrollWrapper).click((e) => {
+            e.preventDefault();
+            return this.pane.prevCycle();
+          });
+          // Set up keyboard navigation
+          keycode = {
+            arrowLeft: 37,
+            arrowRight: 39
+          };
+          keyboardNavigation = (e) => {
+            if (!this.pane._navigationListening) {
+              return;
+            }
+            if (e.keyCode === keycode.arrowRight) {
+              e.preventDefault();
+              this.pane.nextCycle();
+            }
+            if (e.keyCode === keycode.arrowLeft) {
+              e.preventDefault();
+              return this.pane.prevCycle();
+            }
+          };
+          this.pane.contentContainerEl.on("mouseenter", (e) => {
+            if (this.pane._navigationListening) {
+              return;
+            }
+            $(document).on('keydown', keyboardNavigation);
+            return this.pane._navigationListening = true;
+          });
+          this.pane.contentContainerEl.on("mouseleave", (e) => {
+            $(document).off("keydown", keyboardNavigation);
+            return this.pane._navigationListening = false;
+          });
+          // # Set up slider input handling
+          // Utils.$one(".scroll-bar", scrollWrapper).on("input", (e) =>
+          //   newCyc = parseInt(e.target.value)
+          //   @pane.setCycle(newCyc)
+          // )
+
+          // Set up dropdown menu
+          Utils.$one(".custom-dropdown-container", scrollWrapper).click(function(e) {
+            var dropdownMenu;
+            e.preventDefault();
+            e.stopPropagation();
+            dropdownMenu = Utils.$one(".custom-dropdown-menu", scrollWrapper);
+            return dropdownMenu.toggleClass("show");
+          });
+          $("body").click(function(event) {
+            var dropdownMenu;
+            dropdownMenu = Utils.$one(".custom-dropdown-menu", scrollWrapper);
+            return dropdownMenu.removeClass("show");
+          });
+          dropdownMenu = Utils.$one(".custom-dropdown-menu", scrollWrapper);
+          dropdownMenu.find(".custom-dropdown-item").click((e) => {
+            var selectedTimeout;
+            selectedTimeout = parseInt($(e.target).data("timeout"));
+            return this.pane.project.updatePlayState(null, selectedTimeout);
+          });
+          // Set up play/pause button
+          return Utils.$one(".mc-play-pause-btn", scrollWrapper).click((e) => {
+            e.preventDefault();
+            return this.pane.project.updatePlayState(!this.pane.project.isPlaying);
+          });
+        }
+
+        /*
+        Updates the scroll slider's maximum value based on wave data
+        @param {Object} waveData The wave data object
+        */
+        updateSliderRange(waveData) {
+          var max;
+          if (waveData) {
+            max = waveData.getEndCycle();
+            return Utils.$one(".scroll-bar", this.el).attr("max", max.toString());
+          }
+        }
+
+        /*
+        Updates the scroll bubble position and value
+        @param {Number} cycleValue The current cycle value
+        */
+        _updateBubble(cycleValue) {
+          var max, min, range, rangeRect, rightShift, scrollBubbleEl, scrollEl, thumbPosition, thumbWidth;
+          scrollEl = Utils.$one(".scroll-bar", this.el);
+          scrollBubbleEl = Utils.$one(".scroll-bubble", this.el);
+          scrollBubbleEl.css("display", "block");
+          scrollBubbleEl.text(cycleValue);
+          range = scrollEl[0];
+          // TODO: getBoundingRect() is slow here because it forces layout. It might be better
+          //       to listen for resize, and use that to capture the width.
+          rangeRect = range.getBoundingClientRect();
+          thumbWidth = 16; // Approximate width of the thumb
+          min = parseInt(range.min);
+          max = parseInt(range.max);
+          thumbPosition = ((cycleValue - min) / (max - min)) * (rangeRect.width - thumbWidth) + (thumbWidth / 2);
+          rightShift = 120;
+          return scrollBubbleEl.css("left", `${thumbPosition + rightShift}px`);
+        }
+
+        /*
+        Updates the slider value
+        @param {Number} cycleValue The current cycle value
+        */
+        _updateSliderValue(cycleValue) {
+          var scrollEl;
+          scrollEl = Utils.$one(".scroll-bar", this.el);
+          return scrollEl.val(cycleValue);
+        }
+
+        updateCycle(cycleValue) {
+          var max;
+          this._updateBubble(cycleValue);
+          this._updateSliderValue(cycleValue);
+          max = this.pane.waveData ? this.pane.waveData.getEndCycle() : 0;
+          Utils.$one("[data-step='forward']", this.el).prop("disabled", cycleValue >= max);
+          return Utils.$one("[data-step='back']", this.el).prop("disabled", cycleValue <= 0);
+        }
+
+        /*
+        Updates the play/pause button state
+        @param {Boolean} isPlaying Whether the simulation is playing
+        @param {Number} cycleTimeout The cycle timeout value
+        */
+        updatePlayStateUI(isPlaying, cycleTimeout) {
+          var baseTimeout, playIcon, speedup;
+          playIcon = Utils.$one(".play-icon", this.el);
+          if (isPlaying) {
+            playIcon.removeClass("fa-play").addClass("fa-pause");
+          } else {
+            playIcon.removeClass("fa-pause").addClass("fa-play");
+          }
+          this.timestep = cycleTimeout / 1000;
+          baseTimeout = 1000;
+          speedup = baseTimeout / cycleTimeout;
+          return Utils.$one(".current-speed", this.el).text(speedup.toFixed(2).replace(/\.?0+$/, '') + "x");
+        }
+
+        /*
+        Shows the scroll wrapper
+        */
+        show() {
+          return Utils.$one(".scroll-wrapper", this.el).show();
+        }
+
+        // @el.show()
+        /*
+        Hides the scroll wrapper
+        */
+        hide() {
+          return Utils.$one(".scroll-wrapper", this.el).hide();
+        }
+
+      };
+
+      // @property {jQuery} jQuery of the DOM element of this ScrollWrapper.
+      ScrollWrapper.prototype.el = null;
+
+      
+      // @property {Object} Reference to the parent pane
+      ScrollWrapper.prototype.pane = null;
+
+      
+      // @property {Number} Duration of a step for playback.
+      ScrollWrapper.prototype.timestep = 1.0;
+
+      return ScrollWrapper;
+
+    }).call(this);
+    // Export the ScrollWrapper class
+    Utils.extend(ScrollWrapper, module.config());
+    Utils.extend(ScrollWrapper, BladeComponent);
+    return ScrollWrapper;
+  });
+
+}).call(this);

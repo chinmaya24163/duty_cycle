@@ -1,0 +1,180 @@
+(function() {
+  var $, BladeComponent, IDEMenu, Promise, Utils;
+
+  [BladeComponent, $, Promise, Utils] = [];
+
+  /*
+  A module for {IDE} that displays a full-width menu on top of an {FlexSplit}
+
+  @extend BladeComponent
+  @extend ModuleConfigObject
+  */
+  IDEMenu = class IDEMenu {
+    init(path, opts) {
+      this.path = path;
+      //@feedback = opts.feedback
+      return this.compileComponent("menu", opts, this.blade).then((html) => {
+        var items;
+        $(`#${this.path}`).html(html);
+        //$("[data-BugReport-trigger]").click => @feedback.opened()
+        this.setupDropdownMenus();
+        // Test browser for local file system support.
+        items = $(".dropdown-item.mc-localfiles");
+        // Enable menu items based on browser compampatibility.
+        // If browser is Chrome or Edge > version 86, enable local file/project access menu items.
+        if ('launchQueue' in window && 'files' in LaunchParams.prototype) {
+          items.removeClass("disabled");
+          $("[mc-filesystem]").attr("mc-filesystem", "yes"); // Used by CSS to hide/show filesystem UI.
+        } else {
+          // Append to menu item text to indicate no browser support.
+          items.each(function(i, item) {
+            return $(item).text($(item).text() + " (no browser support)");
+          });
+        }
+        return this;
+      });
+    }
+
+    // Manual setup of dropdown menus. This was done by an old version of Tether, used by an old
+    // version of Bootstrap-material-design, which had a non-permissive license.
+    // TODO: This is active for components outside of IDEMenu. Move it.
+    setupDropdownMenus() {
+      /*
+       * Enable Bootstrap 5 dropdowns.
+      $('.dropdown-toggle').each (_, el) ->
+        new bootstrap.Dropdown(el)
+       */
+      // Toggle dropdowns on click.
+      $(document).on("click", ".dropdown-toggle", function(e) {
+        var $menu, $parent, $toggle, wasOpen;
+        e.preventDefault();
+        $toggle = $(e.currentTarget);
+        $menu = $toggle.next(".dropdown-menu");
+        $parent = $toggle.parent();
+        // Close any other open dropdowns
+        $(".dropdown-menu").parent().not($parent).removeClass("open");
+        $(".dropdown-toggle").not($toggle).attr("aria-expanded", "false");
+        // Toggle this one
+        wasOpen = $parent.hasClass("open");
+        $parent.toggleClass("open", !wasOpen);
+        return $toggle.attr("aria-expanded", !wasOpen);
+      });
+      // Close dropdowns when clicking outside the dropdown.
+      $(document).on("click", function(e) {
+        if ($(e.target).closest(".dropdown").length) {
+          return;
+        }
+        $(".dropdown-menu").parent().removeClass("open");
+        return $(".dropdown-toggle").attr("aria-expanded", "false");
+      });
+      
+      // Close dropdown after selecting a menu item
+      $(document).on("click", ".dropdown-item", function(e) {
+        var $dropdown;
+        $dropdown = $(e.currentTarget).closest(".dropdown");
+        $dropdown.removeClass("open");
+        return $dropdown.find(".dropdown-toggle").attr("aria-expanded", "false");
+      });
+      
+      // Collapsible navbar toggler.
+      return $(document).on("click", ".navbar-toggler", function(e) {
+        var $target, wasOpen;
+        e.preventDefault();
+        wasOpen = !$(this).hasClass("collapsed");
+        $(this).toggleClass("collapsed", wasOpen);
+        $(this).attr("aria-expanded", !wasOpen);
+        $target = $($(this).attr("data-target"));
+        $target.toggleClass("in", !wasOpen);
+        return $target.attr("aria-expanded", !wasOpen);
+      });
+    }
+
+    /*
+    Sets project and updates UI.
+    @param {Project} @_project The value to set as project
+    @return IDEMenu
+    */
+    project(_project) {
+      this._project = _project;
+      this._project.on("saveState", (state) => {
+        return this.saveState(state);
+      });
+      return this;
+    }
+
+    /*
+    Sets the time of the last save.
+    @param {Date} save_time The time of the last save
+    @return IDEMenu
+    */
+    save_time(save_time) {
+      var el, savedEl;
+      savedEl = Utils.$one("[mc-menu-status-case=\"saved\"]");
+      el = Utils.$one(".timestamp", savedEl);
+      el.attr("data-livestamp", save_time / 1000);
+      // The timestamp message updates on polling, so it will not update immediately. This results in a glitch
+      // when changing from "saving" to "saved" state, where the message goes from "saving..." to
+      // "saved old-time-ago", then "saved a few seconds ago". This method is only called for recent saves,
+      // so we manually update the message here to reflect a recent save.
+      if ((Date.now() - save_time) < 10000) {
+        el.text("a few seconds ago");
+      }
+      return this;
+    }
+
+    /*
+    OBSOLETE
+    Set project status and update the UI to reflect it.
+    @param {"no project", "saved", "no auth", "saving", "error"} status The status.
+    */
+    save_status(status) {
+      // Assign status attribute. Stylus unhides corresponding Blade based on this.
+      return Utils.$one("[mc-menu-status]").attr("mc-menu-status", status);
+    }
+
+    /*
+    Update save status indicators.
+    */
+    saveState(state) {
+      var localConnected, menuState, serverConnected;
+      // Update save status icons
+      $(".mc-save-status-icon").attr("mc-save-status", state.state != null ? state.state : "null");
+      localConnected = state.target.local.failed ? "error" : (state.target.local.connected ? (state.target.local.connected === "external" ? "external" : "yes") : "no");
+      $(".mc-save-local-icon").attr("mc-save-connected", localConnected);
+      serverConnected = state.target.server.failed ? "error" : state.target.server.connected ? "yes" : "no";
+      $(".mc-save-server-icon").attr("mc-save-connected", serverConnected);
+      menuState = (state.target.local.connected === "external" && !state.target.server.connected) ? "external" : (!state.target.local.connected && !state.target.server.connected) ? "no project" : (state.canEdit === false) ? "no auth" : (state.target.server.failed === "app error") ? "apperror" : (state.target.local.failed || state.target.server.failed) ? "error" : (state.state === "posted") ? "saving" : (state.state === "pending" || state.state === null) ? "saved" : "UNKNOWN"; // Note that CoffeeScript requires the staircasing indentation above for continuation.
+      Utils.assert(menuState !== "UNKNOWN", `Unknown save state: ${state.state}`);
+      // Update mc-menu-status attribute
+      $("[mc-menu-status]").attr("mc-menu-status", menuState).attr("mc-menu-server-connected", state.target.server.connected ? "yes" : "no").attr("mc-menu-local-connected", state.target.local.connected ? "yes" : "no").attr("mc-waveform-locked", state.waveformLocked ? "yes" : "no");
+      // Update enabled/disabled menus.
+      $("#mc-open-menu-item")[!state.target.local.connected && !state.target.server.connected ? "removeClass" : "addClass"]("disabled");
+      $("#mc-connect-menu-item")[!state.target.local.connected && !state.target.server.connected ? "removeClass" : "addClass"]("disabled");
+      $("#mc-save-as-menu-item")[!state.target.local.connected ? "removeClass" : "addClass"]("disabled");
+      $("#mc-close-project-menu-item")[state.target.local.connected || state.target.server.connected ? "removeClass" : "addClass"]("disabled");
+      $("#mc-clone-menu-item")[state.target.server.connected ? "removeClass" : "addClass"]("disabled");
+      $("#mc-server-save-menu-item")[!state.target.server.connected ? "removeClass" : "addClass"]("disabled");
+      //-# If VCD locked changes, update Waveform state from locked->failed or X->locked.
+      //-el = $("[data-tabbedview-ref=\"Waveform\"] > i")
+      //-wasLocked = el.attr("data-status") is "locked"
+      //-if state.waveformLocked isnt wasLocked
+      //-  @_project.waveformPane.setStatus(if state.waveformLocked then "locked" else "fail")
+
+      // Update timestamp
+      if (menuState === "saved") {
+        return this.save_time(state.saveDate);
+      }
+    }
+
+  };
+
+  define("IDEMenu", function(require, exports, module) {
+    BladeComponent = require("BladeComponent");
+    $ = require("jquery");
+    Promise = require("bluebird");
+    Utils = require("Utils");
+    $.extend(IDEMenu.prototype, BladeComponent, module.config());
+    return IDEMenu;
+  });
+
+}).call(this);

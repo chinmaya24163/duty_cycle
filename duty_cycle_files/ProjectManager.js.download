@@ -1,0 +1,1221 @@
+(function() {
+  var boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  define("Project", function(require, exports, module) {
+    /*
+    Represents a project (currently one per IDE session).
+    This extends ProjectManager, which provides the interface with the server.
+    */
+    /*
+    A module that handles projects.
+    This class is mainly responsible for interfacing with the server and the local file system.
+    Project provides the server-side capabilities for a project (currently one per browser session).
+    This class emits various events to indicate the save state of the project.
+
+    @extend ModuleConfigObject
+    */
+    var $, EventEmitter, Project, ProjectManager, Promise, Utils, WaveData, messages, regexes;
+    $ = require("jquery");
+    Utils = require("Utils");
+    Promise = require("bluebird");
+    EventEmitter = require("eventemitter");
+    WaveData = require("VCD");
+    // Regular expression for project URLs.
+    regexes = {
+      sandboxUserProject: /^(\/nda|\/alpha)?\/([a-zA-Z0-9][a-zA-Z0-9\.-_]*)\/([a-zA-Z0-9][a-zA-Z0-9\.-_]*)/
+    };
+    messages = {
+      confirmDelete: `Are you sure you want to delete this project?  This is final, and can't be undone.\n
+Click 'OK' to permanantly delete your project.`,
+      confirmUnsavedPending: `Autosave pending. Click 'cancel' or 'stay on this page' to ensure your changes are saved.`,
+      confirmUnsaved: `Latest changes are unsaved.  Click 'cancel' or 'stay on this page' to ensure your changes are saved.`
+    };
+    ProjectManager = (function() {
+      class ProjectManager {
+        constructor() {
+          /*
+          @param {String} id_token the id_token from Grafword
+          @return {Promise<Object>} a promise that resolves to the user data:
+          */
+          this.getUserData = this.getUserData.bind(this);
+          /*
+          Listen for saves, if components are available and not doing so already.
+          */
+          this.initSave = this.initSave.bind(this);
+          /*
+          Set @saveState.state after updating other fields of @saveState as well as @path, @_canEdit, @localFileHandle, and @localAutosave.
+          Emit "saveState" event.
+          @saveState.target.*.connected are set based on @path and @localFileHandle and
+          @saveState.target.server.canEdit is set based on @_canEdit.
+          @param {String} state value for @saveState.state
+          */
+          this.setSaveState = this.setSaveState.bind(this);
+          // Call @saveNeeded(..) if a save is needed.
+          // @param {Boolean, "new", "share"} immediate if truthy, save immediately using current project, aborting any "pending" save, else create "pending"
+          //                                            save (to save after a timeout); if "new" or "share", save immediately as a new project.
+          this.seeIfSaveNeeded = this.seeIfSaveNeeded.bind(this);
+          
+          // A save is needed. Update saveState accordingly and schedule a save.
+          // @param {Boolean, "new", "share"} immediate if truthy, save immediately using current project, aborting any "pending" save, else create "pending"
+          //                                            save (to save after a timeout); if "new" or "share", save immediately as a new project. Immediate also forces
+          //                                            a save even if the editor is clean, which is useful for new save targets.
+          // @saveState.immediateSaveNeeded also indicates the need for an immediate or "new"/"share" immediate save.
+          // @return {Promise<[local result, server result]>} a promise, if not immediate, the return value containing in [1], the post result if successful.
+          this.saveNeeded = this.saveNeeded.bind(this);
+          
+          // Helper for saveNeeded().
+          // @return {Promise<[local result, server result]>} a promise, the return value containing in [1], the post result if successful.
+          this._doSave = this._doSave.bind(this);
+          
+          // Write to server.
+          // @return {Promise<res>} a promise returning the post result if successful.
+          this._writeToServer = this._writeToServer.bind(this);
+          /*
+          A save has completed.
+          */
+          this._saveComplete = this._saveComplete.bind(this);
+          /*
+          Close connections to local and/or server project and load default template.
+          */
+          this.closeProject = this.closeProject.bind(this);
+          /*
+          Determines if the current user can edit the file.
+          @param {Boolean} force require a new query to the server
+          @return {Promise<Boolean>} `true` if the user can edit.
+          */
+          this.canEdit = this.canEdit.bind(this);
+          /*
+          Set the local file handle page title and Editor tab title.
+          */
+          this.setLocalFileHandle = this.setLocalFileHandle.bind(this);
+          /*
+          Flush the current project.
+          Is a save is pending, save immediately and clear the pending save.
+          */
+          this.flushProject = this.flushProject.bind(this);
+          // Effectively disable EventEmitter listener return value used to trigger just once.
+          this.setOnceReturnValue({});
+          // Save state of the project.
+          // All saves (immediate or scheduled auto-saves) are initiated and serialized via @saveNeeded(..).
+          // No save is initiated until the previous save completes or is aborted (by an immediate save).
+          // All save destinations are written with the same file contents with each auto-save.
+          // Note that codemirror and *ChangeGeneration variables are used to determine if there are
+          // changes to save.
+          this.saveState = {
+            // State of save state machine.
+            // The autosave progresses through, e.g.: "pending"->"posted"->null, then checks for changes
+            // to trigger the next save if necessary (see seeIfChangeNeeded()), thus it is not necessary to check
+            // for changes during "pending" and "posted" states.
+            //   null: no changes to save
+            //   "modified": unsaved changes (no auto-save enabled)
+            //   "pending": save will be kicked off after timeout
+            //   "posted": save has been posted to n save targets (e.g. the server and local file) and not all returned;
+            //             see also target.posted.
+            state: null,
+            // States of individual save targets {local: {...}, server: {...}}.
+            target: {
+              // Each target contains:
+              //   connected: assigned from other variables; true if we're saving to the target (including !_canEdit); "external" for read-only with external editing.
+              //   failed: truthy if the last save failed; for server, "app error" indicates a Makerchip-app save-error
+              //   posted: true if a save has been posted and not returned
+              //   canEdit: assigned from @_canEdit; true if we have write permission
+              local: {
+                connected: false,
+                failed: false,
+                posted: false
+              },
+              server: {
+                connected: false,
+                failed: false,
+                posted: false,
+                canEdit: void 0
+              }
+            },
+            // The ID of the pending save.
+            saveTimeoutId: null,
+            // We avoid overlapping inflight saveAs and auto-save requests. Not sure it's necessary, but it seems safest.
+            // This flags the need for an immediate save (after resolving current save).
+            // Set by saveNeeded(true) if a save is in flight and used whenever project auto-save destinations change;
+            // cleared by successfully initiated save; checked along with editor value changes.
+            immediateSaveNeeded: false,
+            // The timestamp of the file for the last successful save.
+            saveDate: null,
+            // Whether simulation (waveform) is locked.
+            // This is not really save state, but it's used similarly. Maybe saveState should be renamed to projectState,
+            // or maybe we should just pass this whole class in the saveState event.
+            waveformLocked: false
+          };
+          $(window).on("popstate", (event) => {
+            // We pushState for new projects, and only for new projects, except that pushState seems to . But
+            // we cannot transition between projects without a reload. So, all popstate's force a reload.
+            // Old browsers may throw this event on reload, but we shouldn't be listening at that point,
+            // so we should not get stuck in an infinite reload cycle.
+
+            // Make sure contents are saved. This will not save if ! @_canEdit, but it's too late to prompt and turn
+            // back. The browser has already gone to the new URL, and I don't know a convenient way to
+            // restore the old one. I guess it could be stored in the history.state. It's rare the someone
+            // would navigate away from someone else's project without an unload anyway (which does alert).
+            // That would require opening the project, creating a new project, returning to the other project,
+            // editing, and navigating.
+            if ((event.originalEvent.state != null) && typeof event.originalEvent.state.path !== "undefined" && event.originalEvent.state.path !== this.path) { // Note, this can be true for null paths.
+              // Navigated to a different project.
+              this.flushProject();
+              this._forceUnload = true; // used to avoid save changes dialog. TODO: Still needed?
+              // Reload. It seems we need to schedule the reload in the event queue in order for the post request
+              // for the save to go out successfully (at least in Firefox).
+              return setTimeout((function() {
+                return window.location.reload();
+              }), 0);
+            }
+          });
+        }
+
+        /*
+        @return the API URL for project requests
+        */
+        url() {
+          return window.appApiUrl(`/project/${this.user}/${this.path}`);
+        }
+
+        /*
+        @return the IDE URL for the given project
+        */
+        projectIdeUrl(user, path) {
+          return window.appApiUrl(`${this.config.idePath}/${user}/${path}`);
+        }
+
+        /*
+        @return the IDE URL for the current project
+        */
+        currentProjectIdeUrl() {
+          return this.projectIdeUrl(this.user, this.path);
+        }
+
+        getUserData(id_token) {
+          return fetch(`${this.grafword}/userRequests`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              idToken: id_token
+            })
+          }).then(function(response) {
+            if (!response.ok) {
+              throw new Error(`Network response was not ok. Status: ${response.status}, Message: ${errorMessage}`);
+            }
+            return response.json();
+          }).catch(function(error) {
+            return console.error(`Error: ${error}`);
+          });
+        }
+
+        /*
+        @return {Promise<ProjectManager>}
+        */
+        init() {
+          var expectedPath, matches, path, pathname, ref, ref1, serverPathname, url, user;
+          pathname = window.location.pathname;
+          this.config = window.appConfig;
+          this.user = (ref = window.userID) != null ? ref : null;
+          this.path = (ref1 = window.projectID) != null ? ref1 : null;
+          serverPathname = window.serverPathname;
+          expectedPath = this.config.idePath;
+          if (this.user) {
+            expectedPath += "/" + this.user;
+          }
+          if (this.path) {
+            expectedPath += "/" + this.path;
+          }
+          // Sanity check. Make sure the pathname is what we expect.
+          if (window.location.pathname !== window.appApiUrl(serverPathname)) {
+            console.log(`BUG: window.location.pathname (${window.location.pathname}) does not match expected path (${window.appApiUrl(serverPathname)})`);
+          }
+          // Is this a project URL?
+          if (matches = serverPathname.startsWith(this.config.idePath) && serverPathname.slice(this.config.idePath.length).match(regexes.sandboxUserProject)) {
+            [url, this.access_level, user, path] = matches;
+            Utils.assert(user === this.user && path === this.path, "User and path do not match URL.");
+          }
+          if (this.path) {
+            this._firstInit = true;
+            this.attach(); // Attach if possible. No failure recovery.
+          }
+          
+          // Add event listeners, noting that the target elements don't yet exist in the DOM.
+          // TODO: These UI elements belong to IDEMenu, so this code belongs there, but function content should remain here.
+          $("body").on("click", ".mc-save-status-icon", (e) => {
+            var el, target;
+            e.preventDefault();
+            el = e.target.parentElement;
+            target = el.classList.contains("mc-save-local-icon") ? "local" : el.classList.contains("mc-save-server-icon") ? "server" : null;
+            if (target === "local") {
+              this.localSaveAs();
+              return this.initSave();
+            } else if (target === "server") {
+              this.initSave();
+              return this.saveNeeded("new");
+            } else {
+              // attach() done by @saveNeeded("new").
+              return console.log(false, "Unexpected save target.");
+            }
+          });
+          $("body").on("click", ".mc-logout-grafword-menu-item", function(e) {
+            e.preventDefault();
+            return window.ide.updateUser(null);
+          });
+          $("body").on("click", "[href='#login-grafword']", (e) => {
+            var loginUrl, parentUrl, popup;
+            // Login with Grafword.
+            if (true) { // Not already logged in. Just assume for now.
+              e.preventDefault();
+              
+              // Make sure the current file is saved before logging in (and redirecting).
+              // This should happen automatically by the redirect, which unloads the current page (I hope).
+              //@seeIfSaveNeeded(true)
+              //@detach()
+              parentUrl = window.location.href;
+              // URL to open in the popup of grafword
+              loginUrl = `${this.grafword}`;
+              path = e.target.getAttribute("path");
+              if (path) {
+                // If the path is specified, append it to the URL.
+                loginUrl += path;
+              }
+              if (path !== "/register") {
+                // If not registering, redirect to the parent URL after login.
+                loginUrl += `?parentUrl=${encodeURIComponent(parentUrl)}`;
+              }
+              // Open the popup
+              return popup = window.open(loginUrl, "GrafwordSSO", "width=600,height=905");
+            }
+          });
+          // Listen for messages from Grafword
+          $(window).on("message", (event) => {
+            var id_token;
+            // Validate the origin of the message. It has to come from grafword
+            if (event.originalEvent.origin !== this.grafword) {
+              console.error("Invalid origin:", event.originalEvent.origin);
+              return;
+            }
+            // Extract the info from grafword
+            ({id_token} = event.originalEvent.data);
+            if (id_token) {
+              // Redirect to protected route with the id_token as a query parameter
+              // No, don't: window.location.href = "#{redirect_uri}?q=#{encodeURIComponent(id_token)}"
+              return this.getUserData(id_token).then((userData) => {
+                this.userData = userData;
+                this.userData.sso = "Grafword";
+                return window.ide.updateUser(userData);
+              });
+            } else {
+              return console.log("No id token found");
+            }
+          });
+          $("body").on("click", "[href='#open']", (e) => {
+            // Can't open a new file if one is already open. (This handler can be called, but through a button that should look inactive.)
+            if (!this.localFileHandle && !this.saveState.target.local.failed) {
+              e.preventDefault();
+              this.localOpen(false);
+              return this.initSave();
+            }
+          });
+          $("body").on("click", "[href='#connect-file']", (e) => {
+            // Can't open a new file if one is already open. (This handler can be called, but through a button that should look inactive.)
+            if (!this.localFileHandle) {
+              e.preventDefault();
+              return this.localOpen(true);
+            }
+          });
+          $("body").on("click", "[href='#save-as']", (e) => {
+            e.preventDefault();
+            this.localSaveAs();
+            return this.initSave();
+          });
+          $("body").on("click", "[href='#new-project']", (e) => {
+            // Can't create a new server project if already connected. (This handler can be called, but through a button that should look inactive.)
+            if (!this.path) {
+              e.preventDefault();
+              this.initSave();
+              return this.saveNeeded("new");
+            }
+          });
+          // attach() done by @saveNeeded("new").
+          $("body").on("click", "[href='#clone-project']", (e) => {
+            e.preventDefault();
+            return this.cloneProject();
+          });
+          $("body").on("click", "[href='#delete-project']", (e) => {
+            e.preventDefault();
+            if (confirm(messages.confirmDelete)) {
+              this.deleteProject();
+              return this.detach();
+            }
+          });
+          $("body").on("click", "[href='#close-project']", (e) => {
+            e.preventDefault();
+            return this.closeProject();
+          });
+          $("body").on("click", "[href='#share-snapshot']", (e) => {
+            e.preventDefault();
+            return this.saveNeeded("share");
+          });
+          $("body").on("click", "[href='#open-vcd']", (e) => {
+            e.preventDefault();
+            return this.openVCD();
+          });
+          $("body").on("click", "[href='#lock-vcd']", (e) => {
+            e.preventDefault();
+            return this.lockVCD();
+          });
+          $("body").on("click", "[href='#close-vcd']", (e) => {
+            e.preventDefault();
+            return this.closeVCD();
+          });
+          $("body").on("click", "[href='#save-vcd-as']", (e) => {
+            e.preventDefault();
+            return this.saveVCDAs();
+          });
+          window.onbeforeunload = () => {
+            // Warn about unsaved changes before closing. If the unload was caused by a navigation to a new
+            // project URL and the user cancels the reload we requested, they will be left at the new URL
+            // in their old project. This is bad. When attempting to reload, we post the load and set a flag
+            // to avoid asking here (so don't wait for the save response and ignore any typing between events).
+            this.seeIfSaveNeeded(true);
+            if ((this.saveState.state !== null) && !this._forceUnload && (this.saveState.target.local.connected !== "external")) {
+              return messages.confirmUnsaved;
+            } else {
+              return null;
+            }
+          };
+          window.onunload = () => {
+            if (this.user !== null && this.path !== null) {
+              // Detach from the project before tab close.
+              return this.detach();
+            }
+          };
+          return Promise.resolve(this);
+        }
+
+        /*
+        Attaches the editor to the project.
+        Refer to: Project -> editorAttached property.
+        */
+        attach() {
+          if (this.user === null || this.path === null) {
+            return console.log("Info: No user and project to attach to.");
+          } else {
+            return $.post(window.appApiUrl(`/project/${this.user}/${this.path}/attach`), "");
+          }
+        }
+
+        /*
+        Detaches the editor from the project.
+        Refer to: Project -> editorAttached property.
+        */
+        detach() {
+          if (this.user === null || this.path === null) {
+            return console.log("Info: No user and project to detach.");
+          } else {
+            return navigator.sendBeacon(window.appApiUrl(`/project/${this.user}/${this.path}/detach`), "");
+          }
+        }
+
+        initSave() {
+          if (!this._editor || this._initSave_listening) {
+            return;
+          }
+          if (!this._initSave_listening) {
+            this._initSave_listening = true;
+            // When changes are made, makes certain a save will be performed soon.
+            return this._editor.editor.on("changes", () => {
+              if (this._editor.changeEnabled) {
+                return this.saveNeeded();
+              }
+            });
+          }
+        }
+
+        setSaveState(state = void 0) {
+          var ref;
+          if (state !== void 0) {
+            this.saveState.state = state;
+          }
+          this.saveState.target.server.connected = this.path != null;
+          this.saveState.target.local.connected = this.localFileHandle != null ? (this.localConnected ? "external" : true) : false;
+          this.saveState.target.server.canEdit = this._canEdit;
+          this.saveState.waveformLocked = (ref = this.vcd) != null ? ref : {
+            true: false
+          };
+          return this.emit("saveState", this.saveState);
+        }
+
+        /*
+        Post the current state of the project to the server, either as a save, new project, or clone.
+        @param {String} url the URL string of the post (not including app base)
+        @param {String} action the name of the action (starting w/ upper-case)
+        @param {String} contents the project (editor contents) to post
+        @return {Promise<res, postData>} a promise returning {res, postData} or throwing an {Error}.
+        */
+        postProject(url, action, contents) {
+          var fileObj, postDate;
+          postDate = new Date();
+          fileObj = {
+            source: contents
+          };
+          return $.post(url, fileObj, "json").then(function(res) {
+            if (res.err) {
+              throw new Error(res.err);
+            }
+            // TODO: We used to use "lastEdit" from the response, but it is no longer used.
+            //       Maybe it should be eliminated from the response (and tests)?
+            return res;
+          });
+        }
+
+        seeIfSaveNeeded(immediate = false) {
+          if (!this._editor) {
+            return;
+          }
+          if (!this._editor.editor.isClean(this.saveChangeGeneration) || this.saveState.immediateSaveNeeded) {
+            return this.saveNeeded(immediate);
+          }
+        }
+
+        saveNeeded(immediate = false) {
+          var doIt, file, path, reverted, short, timeout;
+          // Combine immediate and @saveState.immediateSaveNeeded, setting both to: "new"/"share" if either is, else true if either is true, else false.
+          // Note: There is no buffering of multiple "new"/"share" requests.
+          if (this.saveState.immediateSaveNeeded && (typeof immediate !== "string")) {
+            immediate = this.saveState.immediateSaveNeeded;
+          }
+          this.saveState.immediateSaveNeeded = immediate;
+          
+          // Replace the pending save with this immediate one.
+          reverted = false;
+          if (this.saveState.state === "pending") {
+            // A save has already been scheduled. See if we need to cancel it.
+            if (immediate) {
+              // Clear the pending save since we'll do an immediate one now.
+              clearTimeout(this.saveState.saveTimeoutId);
+              this.saveState.state = null;
+              if (!immediate) { // Return if Editor is clean since no save is needed.
+                return;
+              }
+            } else if (this._editor.editor.isClean(this.saveChangeGeneration)) {
+              // Editor state has reverted to clean. Clear the pending save and don't save.
+              clearTimeout(this.saveState.saveTimeoutId);
+              this.setSaveState(null);
+              return;
+            }
+          }
+          if (!reverted && (this.saveState.state === null || this.saveState.state === "modified")) {
+            // No save in progress. Kick-off an auto-save. (Else, @seeIfSaveNeeded(..) will be called again when the save completes.)
+            this.saveState.immediateSaveNeeded = false;
+            // Save the project locally at @localFileHandle (if non-null).
+            path = this._canEdit ? this.path : null;
+            file = this.localFileHandle;
+            if (this.localAutosave || path || typeof immediate === "string") {
+              // There is at least one save destination.
+
+              // Save after timeout (unless immediate). Capture save destinations. Use higher timeout if the last save failed, or zero delay if immediate.
+              doIt = () => {
+                return this._doSave(immediate, path, this.localFileHandle);
+              };
+              if (immediate) {
+                return doIt();
+              } else {
+                this.setSaveState("pending"); // indicating auto-save will be done.
+                // Determine the timeout period, using a longer timeout if the last save was entirely unsuccessful.
+                short = (this.saveState.target.server.connected && !this.saveState.target.server.failed) || (this.saveState.target.local.connected && !this.saveState.target.local.failed);
+                timeout = this.constructor.AUTOSAVE_MS * (short ? 1 : 3);
+                return this.saveState.saveTimeoutId = setTimeout(() => {
+                  var currentPath;
+                  currentPath = this._canEdit ? this.path : null;
+                  Utils.assert(currentPath === path && this.localFileHandle === file); // Any changes to these should have done an immediate save which should have cleared this timeout.
+                  return doIt();
+                }, timeout);
+              }
+            } else {
+              // No save destinations.
+              return this.setSaveState("modified"); // indicating unsaved changes.
+            }
+          }
+        }
+
+        _doSave(immediate, path, file) {
+          var changeGeneration, contents, date;
+          contents = this._editor.editor.getValue();
+          changeGeneration = this._editor.editor.changeGeneration(false);
+          this.saveState.target.local.posted = this.localAutosave;
+          this.saveState.target.server.posted = (path != null) || typeof immediate === "string" ? true : false;
+          this.setSaveState("posted");
+          date = new Date();
+          // Save to all destinations.
+          return Promise.join(this._writeLocalTLV(file, contents), this._writeToServer(immediate, path, contents)).then((results) => {
+            // Done saving to all destinations.
+            Utils.assert(!this.saveState.target.local.posted && !this.saveState.target.server.posted, `Save completed without every save target completing (${this.saveState.state}).`);
+            // Update the save state to reflect the save.
+            this.saveChangeGeneration = changeGeneration;
+            this.saveState.saveDate = date;
+            this.setSaveState(null);
+            this.seeIfSaveNeeded();
+            return results;
+          });
+        }
+
+        /*
+        Write the editor contents to the local file.
+        @return {Promise} a promise that resolves when the file is written.
+        */
+        _writeLocalTLV(file, contents) {
+          if (file) {
+            return this._writeLocalFile(file, contents).then(() => {
+              this.saveState.target.local.failed = false;
+              this._saveComplete("local");
+              return null;
+            }).catch((err) => {
+              this.saveState.target.local.failed = true;
+              this._saveComplete("local");
+              Utils.alert(`Error saving local file: ${err.toString()}`);
+              return err;
+            });
+          } else {
+            return Promise.resolve();
+          }
+        }
+
+        /*
+        Write a file to the file system.
+        @return {Promise} a promise that resolves when the file is written or throws an error. (SecurityError and NoModificationAllowedError are handled.)
+        */
+        _writeLocalFile(file, contents) {
+          var writer;
+          file.getFile().then(function(file) {
+            return console.log(`Saving locally to ${file.name}...`);
+          }).catch(function(err) {
+            return Utils.report(`Error getting file to write: ${err.toString()}`);
+          });
+          writer = null;
+          return file.createWritable().then(function(w) {
+            writer = w;
+            return writer.write(contents);
+          }).then(function() {
+            return writer.close();
+          }).catch(function(err) {
+            if (err instanceof DOMException && err.name === "SecurityError") {
+              console.log("SecurityError saving local file. Perhaps the debugger paused execution, and the browser failed to prompt the user for permission.");
+            }
+            if (err instanceof DOMException && err.name === "NoModificationAllowedError") {
+              return Utils.alert("File is not writable. To edit, change file permissions, close, re-open, and re-apply changes.");
+            } else {
+              throw err;
+            }
+          });
+        }
+
+        _writeToServer(immediate, path, contents) {
+          if ((path != null) || typeof immediate === "string") {
+            //if @_editor.editor.isClean(@saveChangeGeneration)
+            //  console.log("DEBUG: Saving when editor state is clean.")   # TODO: Can happen for clone and save as and maybe other cases.
+            return (typeof immediate === "string" ? this.postProject(window.appApiUrl("/project/"), "New Project", contents) : this.postProject(`${this.url()}/save/`, "Save", contents)).then((res) => {
+              if (immediate === "new") {
+                this.changeProject(res, null, "create");
+                this._canEdit = true;
+                this.attach();
+                window.alert("Be sure to bookmark this new project URL if you'll want to return to your work, though server projects are not permanent.");
+              } else if (immediate === "share") {
+                navigator.clipboard.writeText(`${window.location.host}${this.projectIdeUrl(res.user, res.path)}`).then(function() {
+                  return window.alert("A snapshot of your project has been created and its URL copied to the clipboard. Share this URL with others to let them see your project.");
+                });
+              }
+              this.saveState.target.server.failed = false;
+              this._saveComplete("server");
+              return res;
+            }).catch((err) => {
+              this.saveState.target.server.failed = err.status && err.status === 422 ? "app error" : "save error";
+              Utils.alert("Error saving to server");
+              this._saveComplete("server");
+              return null;
+            });
+          } else {
+            return Promise.resolve();
+          }
+        }
+
+        _saveComplete(saveDest) {
+          Utils.assert(this.saveState.target[saveDest].posted);
+          return this.saveState.target[saveDest].posted = false;
+        }
+
+        closeProject() {
+          this.flushProject(); // Needed?
+          // Take the easy road of simply loading the sandbox page.
+          // This should close the old page, thus detaching the project (I hope).
+          // TODO: Preserve URL parameters.
+          return window.location = window.appApiUrl(this.config.idePath);
+        }
+
+        /*
+        Save a reference to an editor.
+        @param {Editor} _editor
+        @return {Promise<ProjectManager>}
+        */
+        editor(_editor) {
+          this._editor = _editor;
+          if (this._firstInit) {
+            this._firstInit = false;
+            this.getProject();
+          }
+          this._initSave_listening = false;
+          this.initSave();
+          return this;
+        }
+
+        canEdit(force = false) {
+          if ((this._canEdit != null) && !force) {
+            //console.debug "Save permission cached (can edit: #{@_canEdit}), not forcing update."
+            return Promise.resolve(this._canEdit);
+          }
+          return $.getJSON(`${this.url()}/canEdit/`).then(({id, canEdit}) => {
+            return this._canEdit = canEdit;
+          }).catch((err) => {
+            var error;
+            if (err.status && err.status === 400) {
+              this._canEdit = false;
+              try {
+                console.log(JSON.parse(err.responseText).err);
+              } catch (error1) {
+                error = error1;
+                console.log("Unable to save.");
+              }
+              return Promise.resolve(false);
+            }
+            throw err;
+          });
+        }
+
+        /*
+        Get the contents and metadata for the current URL and set the value of the editor.
+        */
+        getProject() {
+          this.projectAnalytics("open");
+          return $.get(`${this.url()}/contents/`, "json").then(({id, name, value, canEdit, lastEdit, vcd}) => {
+            this.flushProject();
+            this._canEdit = canEdit;
+            //if @_canEdit
+            //  @emit "saved", new Date()
+            // For "debug mode"
+            // If VCD data is present in the response, we set
+            // the corresponding project flag and emit the waveform.
+            if (vcd != null) {
+              this.setLockedVCD(vcd);
+            }
+            return this._projectLoaded(value, name);
+          }).catch(function(err) {
+            return console.log(`Error fetching project: ${err.toString()}`);
+          });
+        }
+
+        /*
+        Lock the VCD to the one given.
+        @param vcd the VCD data
+        */
+        setLockedVCD(vcd) {
+          Utils.assert(vcd);
+          this.emit("locked vcd", new WaveData(vcd, false));
+          this.vcd = vcd ? true : false;
+          this.setSaveState();
+          return this.emit("simulation-enabled", !this.vcd);
+        }
+
+        /*
+        Update Google Analytics about a new project.
+        @param {String} action the type of action taken, e.g. `"create"`, `"clone"`
+        */
+        projectAnalytics(action) {
+          if (typeof window.ga !== "function") {
+            return;
+          }
+          return window.ga("send", {
+            hitType: "event",
+            eventCategory: "Projects",
+            eventAction: action,
+            eventLabel: `${this.user}/${this.path}`
+          });
+        }
+
+        /*
+        Updates the window URL to the path provided. If Google Analytics is loaded, also update analytics.
+        @param {Object} post response, containing {id, url, user, path} for the new page/project
+        @param {String} oldPath the path reflecting the project prior to the change
+        @param {String} gaMessage message for Google Analytics for this event
+        */
+        changeProject(res, oldPath, gaMessage) {
+          var id, url;
+          ({id, user: this.user, path: this.path} = res);
+          // Modify the URL to reflect the basePath.
+          url = this.currentProjectIdeUrl();
+          // We no longer change from one project to another within the same tab, so the oldPath is always null.
+          Utils.assert(oldPath === null);
+          window.history.replaceState({
+            path: oldPath
+          }, "", window.location);
+          window.history.pushState({path: this.path}, "", url);
+          this.projectAnalytics(gaMessage);
+          if (typeof window.ga === "function") {
+            return window.ga("send", "pageview", location.pathname);
+          }
+        }
+
+        /*
+        Get file text, throwing an error if the file is too large.
+        @param {File} file the file to check
+        @throws {Error} if the file is too large
+        @return {String} the file text
+        */
+        fileText(file) {
+          var max;
+          // Check file size. If too large, alert and return false.
+          max = 50 * 1024 * 1024; // 50 MB
+          if (file.size > max) {
+            throw new Error(`File is too large (${file.size} bytes). Maximum size is ${max} bytes.`);
+          }
+          return file.text();
+        }
+
+        /*
+        Open a local project file.
+        @return {Promise<Boolean>} `true` if the file was opened successfully.
+        */
+        localOpen(connect) {
+          return window.showOpenFilePicker({
+            multiple: false,
+            types: [this.tlvFileTypes]
+          }).then((fileHandles) => {
+            return fileHandles[0].getFile().then((file) => {
+              return this.fileText(file);
+            }).then((text) => {
+              return fileHandles[0].queryPermission({
+                mode: "readwrite"
+              }).then((grant) => {
+                this.flushProject();
+                this.setLocalFileHandle(fileHandles[0], connect);
+                this._localWritable = grant === "granted" || grant === "prompt"; // For "prompt", don't prompt user yet; wait for auto-save to fail.
+                if (!this.localConnected && !this._localWritable) {
+                  Utils.alert("File is read-only; edits will not be saved. To write, change permissions and re-open.");
+                }
+                this._projectLoaded(text, null, this.localConnected || !this._localWritable); // Note: name set above in @setLocalFileHandle.
+                return true;
+              }).catch(function(err) {
+                Utils.alert(`Error loading file: ${err.toString()}. Application state could be corrupt.`);
+                return false;
+              });
+            }).catch(function(err) {
+              Utils.alert(`Error reading file: ${err.toString()}`);
+              return false;
+            });
+          }).catch(function(err) {
+            // Unless canceled by the user, this is an error.
+            if (!(err instanceof DOMException && err.name === "AbortError")) {
+              Utils.alert(`Error opening file: ${err.toString()}`);
+            }
+            return false;
+          });
+        }
+
+        /*
+        A project has been loaded from any source.
+        */
+        _projectLoaded(value, name, readOnly = false) {
+          var children;
+          this.saveState.saveDate = new Date();
+          this.setSaveState(readOnly ? "modified" : null);
+          if (name) {
+            document.title = name + " - " + document.title;
+          }
+          this._editor.editor.setOption("readOnly", readOnly ? "nocursor" : false);
+          if (readOnly) {
+            // Set title of Editor tab to "Source". Currently there is no way out of connected mode, so this change is permanent.
+            children = $("[data-tabbedview-ref=\"Editor\"]").get(0).childNodes;
+            Utils.assert(children.length === 2);
+            children[1].nodeValue = "Source";
+          }
+          this._editor.setValue(value, false, readOnly);
+          this._editor.compile(true, true);
+          this._editor.setStatus("outdated");
+          this._editor.editor.getDoc().clearHistory();
+          return this.saveChangeGeneration = this._editor.editor.changeGeneration(true);
+        }
+
+        setLocalFileHandle(localFileHandle, connect) {
+          this.localFileHandle = localFileHandle;
+          this.localConnected = connect;
+          this.localAutosave = this.localFileHandle && !connect;
+          this.localFileHandle.getFile().then(function(file) {
+            return document.title = file.name;
+          });
+          if (connect) {
+            return $("[data-tabbedview-ref='editor']").text("Source");
+          }
+        }
+
+        flushProject() {
+          if (this.saveState.state === "pending") {
+            return this.saveNeeded(true);
+          }
+        }
+
+        /*
+        Save the project locally under a new name.
+        */
+        localSaveAs() {
+          console.log("Saving locally as...");
+          return window.showSaveFilePicker({
+            types: [this.tlvFileTypes]
+          }).then((fileHandle) => {
+            this.flushProject();
+            this.setLocalFileHandle(fileHandle, false);
+            return this.saveNeeded(true);
+          }).catch(function(err) {
+            if (!(err instanceof DOMException && err.name === "AbortError")) {
+              return Utils.alert(`Error saving file: ${err.toString()}`);
+            }
+          });
+        }
+
+        /*
+        Asynchronously clone the current project in a new tab or return null Promise.
+        @return {Promise} resolves to null if no current project or user
+        */
+        cloneProject() {
+          var url;
+          if (!this.path) {
+            return Promise.resolve(null);
+          }
+          url = this.currentProjectIdeUrl();
+          //@path = null  # to prevent saves and state updates for old project
+          this.projectAnalytics("clone");
+          return this.postProject(window.appApiUrl("/project/"), "Clone", this._editor.editor.getValue()).then((res) => {
+            // Open a new tab with the new project.
+            window.open(this.projectIdeUrl(res.user, res.path));
+            return res;
+          }).catch(function(err) {
+            return null;
+          });
+        }
+
+        /*
+        Delete the current project.
+        */
+        deleteProject() {
+          if (!this.path) {
+            return;
+          }
+          return $.get(`${this.url()}/delete/`, "json").then(({
+              id,
+              url,
+              user: user1,
+              path: path1
+            }) => {
+            this.user = user1;
+            this.path = path1;
+            this.projectAnalytics("delete");
+            return window.location = window.appApiUrl(`${this.config.idePath}${this.access_level}/`);
+          });
+        }
+
+        /*
+        Open a VCD waveform for debugging.
+        */
+        openVCD() {
+          return window.showOpenFilePicker({
+            multiple: false,
+            types: [this.waveformFileTypes]
+          }).then(function(fileHandles) {
+            return fileHandles[0].getFile();
+          }).then((file) => {
+            return this.fileText(file);
+          }).then((vcd) => {
+            return this.setLockedVCD(vcd);
+          }).catch(function(err) {
+            // Unless canceled by the user, this is an error.
+            if (!(err instanceof DOMException && err.name === "AbortError")) {
+              Utils.alert(`Error opening waveform file: ${err.toString()}`);
+            }
+            return false;
+          });
+        }
+
+        /*
+        Lock the VCD file to the current one. Don't simulate.
+        */
+        lockVCD() {
+          this.vcd = true;
+          this.setSaveState();
+          return this.emit("simulation-enabled", false);
+        }
+
+        /*
+        Close the VCD trace, re-enabling simulation and waveform generation.
+        */
+        closeVCD() {
+          this.vcd = false;
+          this.setSaveState();
+          return this.emit("simulation-enabled", true);
+        }
+
+        /*
+        Save the VCD trace.
+        */
+        saveVCDAs() {
+          console.log("Saving VCD as...");
+          return window.showSaveFilePicker({
+            types: [this.waveformFileTypes]
+          }).then(function(file) {
+            // TODO: Get the VCD file. I'm not sure we still have it. Might need to fetch it from the server.
+            //       Giving up on this for now.
+            // WIP...   contents = ...
+            return _writeLocalFile(file, contents).then(function() {
+              Utils.unwrittenCode();
+              return null;
+            }).catch(function(err) {
+              Utils.unwrittenCode();
+              Utils.alert(`Error saving local file: ${err.toString()}`);
+              return err;
+            });
+          });
+        }
+
+        getWaveData() {
+          var ref, ref1, ref2;
+          return (ref = window.ide) != null ? (ref1 = ref.viewer) != null ? (ref2 = ref1.wg) != null ? ref2.waveData : void 0 : void 0 : void 0; // TODO: This will be cleaner once IDE owns the waveData.
+        }
+
+        /*
+        Update the cycle value and stop playing.
+        @param {Number} newCycle The new cycle value to update. Emits a "cycle-updated" event with the updated cycle value.
+        */
+        setCycle(newCyc) {
+          this.updateCycle(newCyc);
+          return this.updatePlayState(false);
+        }
+
+        getEndCycle() {
+          var wd;
+          wd = this.getWaveData();
+          if (wd) {
+            return wd.getEndCycle();
+          } else {
+            return 0;
+          }
+        }
+
+        /*
+        Set the cycle.
+        @param {Number} cycle The cycle value to set.
+        */
+        updateCycle(newCyc) {
+          var max, min, wd;
+          wd = this.getWaveData();
+          min = 0;
+          max = this.getEndCycle();
+          if (newCyc < min) {
+            newCyc = min;
+          }
+          if (newCyc > max) {
+            newCyc = max;
+          }
+          this.cyc = newCyc;
+          return this.emit("cycle-update", this.cyc);
+        }
+
+        /*
+        Update either or both of @isPlaying and @cycleTimeout.
+        @param {Boolean, undefined} isPlaying the new value for @isPlaying
+        @param {Number} cycleTimeout (opt) the new value for @cycleTimeout
+        */
+        updatePlayState(isPlaying, cycleTimeout = void 0) {
+          // default is no-change
+          if (isPlaying == null) {
+            isPlaying = this.isPlaying;
+          }
+          if (cycleTimeout == null) {
+            cycleTimeout = this.cycleTimeout;
+          }
+          if (isPlaying !== this.isPlaying || cycleTimeout !== this.cycleTimeout) {
+            // update state and interval
+            if (this.isPlaying) {
+              clearInterval(this.playInterval);
+              this.playInterval = null;
+            }
+            if (isPlaying) {
+              // Step immediately if not previously playing and then set interval.
+              if (!this.isPlaying) {
+                this.updateCycle(this.cyc + 1, false);
+              }
+              this.playInterval = setInterval(() => {
+                if (this.cyc < this.getEndCycle()) {
+                  return this.updateCycle(this.cyc + 1, false);
+                } else {
+                  // Stop playing at end of wavedata.
+                  return this.updatePlayState(false);
+                }
+              }, cycleTimeout);
+            }
+            this.isPlaying = isPlaying;
+            this.cycleTimeout = cycleTimeout;
+          }
+          // Emit change for Panes to update UI (even if there was no change).
+          return this.emit("play-state-change", this.isPlaying, this.cycleTimeout);
+        }
+
+      };
+
+      // @property {String} "", "/alpha", or "/nda".
+      //     "": Public permissions.
+      //     "/alpha": Alpha features behind a password for consumers and testers who understand the alpha
+      //               nature of the features.
+      //     "/nda": confidential content can be displayed.
+      ProjectManager.prototype.access_level = null;
+
+      // @property {Boolean} truthy iff the simulation is locked to a VCD trace and simulation is not performed.
+      // For server projects, the VCD file may be provided in the project contents response ("debug mode") and
+      // this is set accordingly and VCD data is emitted immediately to be processed by the waveform viewer and
+      // viz pane, without performing simulation (which would otherwise emit the VCD upon completion).
+      // This may also be set via the menu to lock the waveform and avoid simulation.
+      // TODO: This is badly-named and redundant with saveState.waveformLocked.
+      ProjectManager.prototype.vcd = false;
+
+      // @property {String} the current username/shortid
+      ProjectManager.prototype.user = null;
+
+      // @property {Object} the current user, fields: {firstname, lastname, email}
+      ProjectManager.prototype.userData = null;
+
+      // @property {String} the current server project path/shortid; false indicates that a new project is to be created....WIP
+      ProjectManager.prototype.path = null;
+
+      // @property {Object} the app configuration object
+      ProjectManager.prototype.config = null;
+
+      // @property {Editor, null} the editor pane
+      ProjectManager.prototype._editor = null;
+
+      // @property {boolean, undefined} server project has write permission
+      ProjectManager.prototype._canEdit = void 0;
+
+      // @property {FileSystemFileHandle} the local project file or null if not saved locally
+      ProjectManager.prototype.localFileHandle = null;
+
+      // @property {Boolean} autosaving to a local file (aka @localFileHandle and not @localConnected).
+      ProjectManager.prototype.localAutosave = false;
+
+      // @property {Boolean, undefined} local file has write permission
+      ProjectManager.prototype._localWritable = void 0;
+
+      // @property {Boolean, null} local file is connected for external editing.
+      //                           (Note that @saveState.target.local.connected has a different meaning.)
+      ProjectManager.prototype.localConnected = null;
+
+      // @property {int} after keystroke, save after this delay
+      ProjectManager.AUTOSAVE_MS = 4000;
+
+      // @property {int} the "change generation" (see codemirror) of the last successful save.
+      ProjectManager.prototype.saveChangeGeneration = -1;
+
+      // @property {Object} The save state of the project. This object is emitted by the "saveState" event.
+      ProjectManager.prototype.saveState = null;
+
+      ProjectManager.prototype._forceUnload = false;
+
+      // For the Grafword SSO.
+      ProjectManager.prototype.grafword = "https://login.grafword.com";
+
+      ProjectManager.prototype.tlvFileTypes = {
+        description: "TL-Verilog files",
+        accept: {
+          "text/tl-verilog": [".v", ".sv", ".tlv"]
+        }
+      };
+
+      ProjectManager.prototype.waveformFileTypes = {
+        description: "Waveform files",
+        accept: {
+          "text/vcd": [".vcd"]
+        }
+      };
+
+      /*
+      Maintaining cycle number and play state.
+      TODO: Move this to a new Session class.
+      */
+      // @property {int} The current cycle value, initialized to 0.
+      ProjectManager.prototype.cyc = 0;
+
+      // @property {Boolean} Whether the session simulation is playing.
+      ProjectManager.prototype.isPlaying = false;
+
+      // @property {Number} The interval ID for playing (stepping cycles).
+      ProjectManager.prototype.playInterval = null;
+
+      // @property {Number} The timeout in ms for each step in playing.
+      ProjectManager.prototype.cycleTimeout = 1000;
+
+      return ProjectManager;
+
+    }).call(this);
+    Project = (function() {
+      class Project extends ProjectManager {
+        constructor() {
+          super("Project");
+          /*
+          Associate the IDE.
+          @param {IDE} ide The IDE.
+          */
+          this.initIDE = this.initIDE.bind(this);
+        }
+
+        initIDE(ide) {
+          boundMethodCheck(this, Project);
+          this.ide = ide;
+          this.editorPane = this.ide.editor;
+          this.navTlvPane = this.ide.navtlv;
+          this.graphPane = this.ide.graph;
+          this.waveformPane = this.ide.viewer;
+          this.vizPane = this.ide.viz;
+          return this.logPane = this.ide.errorlog;
+        }
+
+      };
+
+      // @Property {IDE} the IDE.
+      Project.prototype.ide = null;
+
+      // @property {Editor} the Editor
+      Project.prototype.editorPane = null;
+
+      // @property {NavTLV} the NavTLV pane
+      Project.prototype.navTlvPane = null;
+
+      // @property {Graph} the Editor
+      Project.prototype.graphPane = null;
+
+      // @property {WaveformViewer} the WaveformViewer
+      Project.prototype.waveformPane = null;
+
+      // @property {VizPane} the VIZ pane
+      Project.prototype.vizPane = null;
+
+      // @property {ErrorLog} the log pane
+      Project.prototype.logPane = null;
+
+      return Project;
+
+    }).call(this);
+    //Project:: = $.extend {}, EventEmitter::, module.config(), Project::
+    Utils.extend(Project, module.config());
+    Utils.extend(Project, EventEmitter.prototype);
+    return Project;
+  });
+
+}).call(this);

@@ -1,0 +1,579 @@
+(function() {
+  var hasProp = {}.hasOwnProperty;
+
+  define("TabbedView", function(require, exports, module) {
+    /*
+    A module that describes a tabbed layout, with multiple panels inside.
+
+    @extend BladeComponent
+    @extend ModuleConfigObject
+    @extend FlexSplit.Child
+    */
+    var $, BladeComponent, FlexSplit, Logging, Promise, TabbedView, Utils;
+    BladeComponent = require("BladeComponent");
+    FlexSplit = require("FlexSplit");
+    Promise = require("bluebird");
+    $ = require("jquery");
+    Utils = require("Utils");
+    Logging = require("Logging");
+    require("jquery.ui");
+    TabbedView = (function() {
+      var el, ref, status;
+
+      class TabbedView {
+        constructor() {
+          //console.log "Moving tab #{pane.name} from #{sourceTabbbed.path} into #{destTabbed.path}."
+          this.initPaneSortable = this.initPaneSortable.bind(this);
+          /*
+          Ensures that tabs are ready to be sorted and moved between tab bars, with all listeners in place.
+          TODO: Hopefully this is only called once now.  Can delete the cleanup steps?
+          */
+          this.initSortable = this.initSortable.bind(this);
+        }
+
+        /*
+        A Font-Awesome status DOM element.
+        @param {String} icon Eg, " fa-circle" for .fa.fa-fw.fa-circle
+        @param {String} style the style attribute for the icon or null
+        @return the DOM element.
+        */
+        static _faStatusEl(icon, style) {
+          var el;
+          el = document.createElement("I");
+          el.setAttribute("class", "fa fa-fw" + icon);
+          return el;
+        }
+
+        /*
+        Initialize
+        @param {String} path The path for this component.
+        @param {"left", "top", "right", "bottom", "center"} side The side this {TabbedView} is within in its parent.
+        @param {FlexSplit} parent The {FlexSplit} in which this {TabbedView} is to be contained.
+        @return {Promise} Resolve to this.
+        */
+        init(path, side, parent) {
+          this.path = path;
+          this.parent = parent;
+          this.panes = {};
+          this.intoSplit(side, this.parent);
+          TabbedView.allTabbedViews[this.path] = this;
+          if (TabbedView.allTabbedViews.length > 10) {
+            consol.log("DEBUG: My, there are a lot of TabbedViews.  Is delete() being called?");
+          }
+          this.lastid = 0;
+          return this.compileComponent("TabbedView", {
+            path: this.path,
+            tabbedview: this
+          }, this.blade).then((html) => {
+            var containerEl;
+            this.tabbedviewEl = $(html);
+            // Add to DOM.
+            containerEl = Utils.$one(`#${this.path}`);
+            containerEl.append(this.tabbedviewEl); // TODO: check this
+            this.addEventListeners();
+            this.tabContainer = $(".nav-tabs", containerEl);
+            this.paneContainer = $("[data-tabbedview-panes]", containerEl);
+            return this.initSortable();
+          }).then(() => {
+            return this;
+          });
+        }
+
+        /*
+        Adds event listeners.
+        */
+        addEventListeners() {
+          var mergeEl, splitHorizontalEl, splitVerticalEl;
+          // Add event listeners (for some reason blade fails to provide local context if these are included in blade.)
+          splitHorizontalEl = Utils.$one("[data-split-horizontal-menu-item]", this.tabbedviewEl);
+          splitHorizontalEl.mouseover(() => {
+            return this.preview("horizontal");
+          });
+          splitHorizontalEl.mouseout(() => {
+            return this.unpreview("horizontal");
+          });
+          splitHorizontalEl.click((e) => {
+            e.preventDefault();
+            return this.divide("horizontal");
+          });
+          splitVerticalEl = Utils.$one("[data-split-vertical-menu-item]", this.tabbedviewEl);
+          splitVerticalEl.mouseover(() => {
+            return this.preview("vertical");
+          });
+          splitVerticalEl.mouseout(() => {
+            return this.unpreview("vertical");
+          });
+          splitVerticalEl.click((e) => {
+            e.preventDefault();
+            return this.divide("vertical");
+          });
+          mergeEl = $("[data-merge-menu-item]", this.tabbedviewEl);
+          mergeEl.mouseover(() => {
+            return this.mergePreview();
+          });
+          mergeEl.mouseout(() => {
+            return this.mergeUnpreview();
+          });
+          return mergeEl.click((e) => {
+            e.preventDefault();
+            return this.close();
+          });
+        }
+
+        /*
+        Resize event listener.
+        Resize the visible pane.
+        */
+        resize() {
+          if (this.activePane) {
+            return this.activePane.resize();
+          }
+        }
+
+        /*
+        Delete this tab
+        */
+        delete() {
+          return delete TabbedView.allTabbedViews[this.path];
+        }
+
+        /*
+        Set splitSide and containingSplit.
+        TODO: Make a Mixin for FlexSplitPanel.  splitSide <=> parentKey, containingSplit <=> parent
+        */
+        intoSplit(splitSide, containingSplit) {
+          this.splitSide = splitSide;
+          this.containingSplit = containingSplit;
+          return this;
+        }
+
+        /*
+        Calls preview method of the parent {FlexSplit} for this {TabbedView}'s side.
+        @param {"vertical", "horizontal"} direction the direction to create the subsplit
+        */
+        preview(direction) {
+          return this.containingSplit.preview(this.splitSide, direction);
+        }
+
+        /*
+        Calls unpreview method of the parent {FlexSplit} for this {TabbedView}'s side.
+        @param {"vertical", "horizontal"} direction the direction to create the subsplit
+        */
+        unpreview(direction) {
+          return this.containingSplit.unpreview(this.splitSide, direction);
+        }
+
+        mergePreview() {
+          return this.containingSplit.mergePreview();
+        }
+
+        mergeUnpreview() {
+          return this.containingSplit.mergeUnpreview();
+        }
+
+        /*
+        Calls divide method of the parent {FlexSplit} for this {TabbedView}'s side.
+        @param {"vertical", "horizontal"} direction the direction to create the subsplit
+        @return {Promise<Array<TabbedView>>} the two newly created `TabbedView`s that were inserted.
+        */
+        divide(direction) {
+          return this.containingSplit.divide(this.splitSide, direction, this);
+        }
+
+        close() {
+          return this.containingSplit.close(this.splitSide);
+        }
+
+        /*
+        Adds a tab/pane to this {TabbedView}.
+        @param {Pane} pane The pane to add to the page
+        @return {Promise<Pane>}
+        */
+        append(pane) {
+          this.addPane(pane);
+          this.tabContainer.append(pane.tabEl);
+          if (pane.active) {
+            return pane.resize();
+          }
+        }
+
+        /*
+        Add a {Pane} to this {TabbedView}.  Does not add the tab.  Adds the {Pane} to the DOM
+        if pane.alwaysInDOM.  Does not activate the pane.
+        @param {Pane} pane the {Pane} to add.
+        */
+        addPane(pane) {
+          Utils.assert(pane.isDetached());
+          if (this.panes[pane.seqID]) {
+            console.log("Adding a pane to TabbedView whose ID already exists.");
+          }
+          this.panes[pane.seqID] = pane;
+          pane.tabbedview = this;
+          // Add pane to DOM.
+          if (pane.alwaysInDOM) {
+            this.paneContainer.append(pane.paneEl);
+            if (pane.DOMState) {
+              return pane.restoreDOMState(pane.DOMState);
+            }
+          }
+        }
+
+        /*
+        Detach all {Pane}s from this {TabbedView} from the DOM.
+        @return {Array<Panes>} the detached panes ordered by position
+        */
+        detachPanes() {
+          var id, pane, ref1, ref2, ret;
+          ret = [];
+          ref1 = this.panes;
+          // Construct return array of Pane's (based on their positions, which we must determine while they are still attached).
+          for (id in ref1) {
+            pane = ref1[id];
+            ret[pane.getTabPosition()] = pane;
+          }
+          ref2 = this.panes;
+          // Detach panes.
+          for (id in ref2) {
+            pane = ref2[id];
+            pane.detach();
+          }
+          return ret;
+        }
+
+        /*
+        @return {int} count of the number of tabs in this {TabbedView}
+        */
+        getTabCnt() {
+          return tabContainer.children().length;
+        }
+
+        /*
+        Get corresponding {Pane} of a tab DOM node (for processing events on the tab).
+        @param [Node] DOM node of the tab
+        @return {Pane} the pane
+        */
+        getPaneOfTabEl(el) {
+          return TabbedView.allPanes[$(el).attr("data-tabbedview-ref")];
+        }
+
+        /*
+        @param [Node] DOM node of the tab
+        @return {TabbedView} the tabbed view the tab is in (based on DOM)
+        */
+        getTabbedViewOfTabEl(el) {
+          var ret;
+          ret = TabbedView.allTabbedViews[$(el).parents("[data-TabbedView]").parent().attr("id")];
+          if (!ret) {
+            console.log("getTabbedViewOfTabEl failed");
+          }
+          return ret;
+        }
+
+        movePane(pane, destTabbed) {
+          var sourceTabbed;
+          sourceTabbed = pane.tabbedview;
+          if (destTabbed !== sourceTabbed) {
+            // Move between TabbedViews
+
+            // Dissociate this Pane from this TabbedView. This activates a new Pane if necessary and
+            // removes pane from @panes.
+            sourceTabbed.dissociate(pane);
+            pane.detach(true);
+            destTabbed.addPane(pane);
+            if (pane.DOMState) {
+              pane.restoreDOMState(pane.DOMState);
+            }
+            pane.DOMState = null;
+          }
+          return destTabbed.activatePane(pane);
+        }
+
+        initPaneSortable() {
+          // Make the pane container a sortable that can receive tabs
+          return this.paneContainer.sortable({
+            connectWith: "[data-TabbedView-tabs]>.nav",
+            items: "a.mc-pane-tab",
+            over: (event, ui) => {
+              $(">[data-TabbedView-blocker]", this.paneContainer).addClass("TabbedView-droppable-hover");
+              return $("[data-TabbedView-tabs]>.nav", this.paneContainer.parent()).append("<a class='TabbedView-sortable-placeholder'></a>");
+            },
+            out: (event, ui) => {
+              $(">[data-TabbedView-blocker]", this.paneContainer).removeClass("TabbedView-droppable-hover");
+              return $("[data-TabbedView-tabs]>.nav>.TabbedView-sortable-placeholder", this.paneContainer.parent()).remove();
+            },
+            receive: (event, ui) => {
+              var pane, tabEl;
+              $(">[data-TabbedView-blocker]", this.paneContainer).removeClass("TabbedView-droppable-hover");
+              $("[data-TabbedView-tabs]>.nav>.TabbedView-sortable-placeholder", this.paneContainer.parent()).remove();
+              // Get the tab element
+              tabEl = ui.item[0];
+              // Get the pane
+              pane = this.getPaneOfTabEl(tabEl);
+              if (!pane) {
+                return;
+              }
+              //Move the tab back to our tab container
+              ui.item.detach();
+              this.tabContainer.append(ui.item);
+              return this.movePane(pane, this);
+            }
+          });
+        }
+
+        initSortable() {
+          /*
+          Adds a dummy div.nav.nav-tabs to the body (if it doesn't already exist) to display mid-drag tabs in.
+          */
+          if ($("body > .nav").length < 1) {
+            $("body").append($("<div>").addClass("nav nav-tabs"));
+          }
+          /*
+          Remove old sortable bindings to ensure we don't duplicate them.
+          */
+          if (this.tabContainer.hasClass("sortable")) {
+            //.off "sortstart"
+            this.tabContainer.sortable("destroy").removeClass("sortable").off("sortremove").off("SortMoveElement").off("sortstop");
+          }
+          /*
+          Add sortable binding for tabs, so they can be rearranged or dropped into other tab holders.
+          */
+          this.tabContainer.sortable({
+            connectWith: "[data-TabbedView-tabs] .nav, [data-tabbedview-panes]", // Connect to tabs AND panes
+            scroll: false,
+            appendTo: "body > .nav",
+            helper: "clone",
+            placeholder: "TabbedView-sortable-placeholder"
+          }).addClass("sortable");
+          /*
+          `sortstart` triggered by the sorting library when one of our tabs starts to move.
+          */
+          this.tabContainer.on("sortstart", (event, ui) => {
+            var item, pane, tabEl;
+            //console.log "sortstart"
+            ({item} = ui);
+            tabEl = item[0];
+            pane = this.getPaneOfTabEl(tabEl);
+            return pane.DOMState = pane.saveDOMState();
+          });
+          /*
+          `sortremove` triggered by the sorting library when one of our tabs moves.
+          Check to see if it is moving out of our tab group, and inform all tab groups that it's moving.
+          ##
+          @tabContainer
+            .on "sortremove", (event, ui) =>
+              return
+           */
+          /*
+          `sortstop` triggered by the sorting library when a tab that was in this {TabbedView} is moved.
+          */
+          this.tabContainer.on("sortstop", (event, ui) => {
+            var destTabbed, item, pane, tabEl;
+            //console.log "sortstop"
+            ({item} = ui);
+            tabEl = item[0];
+            pane = this.getPaneOfTabEl(tabEl);
+            
+            // Check if pane still belongs to this TabbedView
+            if (!this.panes[pane.seqID]) {
+              console.log("Pane already moved by receive event, ignoring sortstop");
+              return;
+            }
+            Utils.assert(this === pane.tabbedview, "\"sortstop\" triggered on TabbedView for tab it doesn't contain.");
+            destTabbed = this.getTabbedViewOfTabEl(tabEl);
+            return this.movePane(pane, destTabbed); // Handles both move within TabbedView and move between TabbedViews
+          });
+          
+          // Also set up pane container as sortable receiver
+          return this.initPaneSortable();
+        }
+
+        /*
+        Dissociate a given {Pane} from this {TabbedView}.
+        Activate a new tab if necessary, and
+        delete the given pane from @panes.
+        This method does not remove tab/pane from the DOM.
+        @param {Pane} pane The {Pane} to dissociate.
+        */
+        dissociate(pane) {
+          var id, newPane, p, ref1;
+          /*
+          If this pane is active, activate the first pane
+          in panes that isnt 'pane' (or no pane).  (This will deactivate 'pane'.)
+          */
+          if (pane === this.activePane) {
+            newPane = null;
+            ref1 = this.panes;
+            for (id in ref1) {
+              p = ref1[id];
+              if (p !== pane) {
+                newPane = p;
+                break;
+              }
+            }
+            this.activatePane(newPane);
+          }
+          // Remove pane from @panes.
+          Utils.assert(this.panes[pane.seqID], `Removing a pane ${pane.mnemonic} from TabbedView it isn't in.`);
+          return delete this.panes[pane.seqID];
+        }
+
+        /*
+        Gets the position of a tab relative to other tabs.
+        @param {jQuery} item a tab
+        @return {int} the index of the given tab
+        */
+        getPosition(item) {
+          return item.parent().children().index(item);
+        }
+
+        /*
+        Returns the largest position of any tab in the given array of tabs.
+        @return {int} the largest position
+        */
+        maxPosition(tabs) {
+          var k, position;
+          return Math.max(-1, ...((function() {
+            var results;
+            results = [];
+            for (k in tabs) {
+              if (!hasProp.call(tabs, k)) continue;
+              ({position} = tabs[k]);
+              results.push(position);
+            }
+            return results;
+          })()));
+        }
+
+        /*
+        Sorts the tabs object into an array of keys ordered by their position
+        @return {Array<int>} the keys ordered by the position of the tab they represent.
+        */
+        sortPosition(tabs) {
+          return Object.keys(tabs).sort(function(a, b) {
+            return tabs[a].position - tabs[b].position;
+          });
+        }
+
+        /*
+        Activate the given pane.
+        */
+        activatePane(pane) {
+          var id, p, ref1;
+          if (pane !== this.activePane) {
+            ref1 = this.panes;
+            // Set active tab.
+            for (id in ref1) {
+              p = ref1[id];
+              p.setTabActive(p === pane);
+            }
+            // Update DOM for panes.  Detach old and attach new active pane DOM element and
+            // update active attributes.
+            if (this.activePane) {
+              if (this.activePane.alwaysInDOM) {
+                this.activePane.paneEl.attr("data-tabbedview-active", "false");
+              } else {
+                // TODO: What should we do with DOM state in this case? I don't think we currently have any tabs that aren't alwaysInDOM.
+                this.activePane.paneEl.detach();
+              }
+            }
+            if (pane) {
+              if (!pane.alwaysInDOM) {
+                // TODO: What should we do with DOM state in this case? I don't think we currently have any tabs that aren't alwaysInDOM.
+                this.paneContainer.append(pane.paneEl);
+              }
+              pane.resize();
+              pane.paneEl.attr("data-tabbedview-active", "true");
+            }
+            // Update model.
+            return this.activePane = pane;
+          }
+        }
+
+      };
+
+      // Static members:
+
+      // All current {TabbedViews} (globally), indexed by their @path
+      TabbedView.allTabbedViews = {};
+
+      // These two would be more logically placed in Pane, but that creates a require
+      // dependence on Pane, which causes a circular dependence.
+
+      // @property {Integer} For producing unique identifiers for Panes.
+      TabbedView.paneID = 0;
+
+      // All current {Pane}s (globally), indexed by name (tag text)
+      TabbedView.allPanes = {};
+
+      // @property {int} Stores the index of the last generated element.
+      TabbedView.prototype.lastid = null;
+
+      // @property {String} My path (as reflected in my id in DOM, and as used to index into @allTAbbedViews)
+      TabbedView.prototype.path = null;
+
+      // @property {Object} The panes of this TabbedView, indexed by Pane.seqID.
+      TabbedView.prototype.panes = null;
+
+      // @property {int} The number of panes in 'panes'.
+      //paneCnt: 0
+
+      // @property {jQuery} jQuery for this {TabbedView}
+      TabbedView.prototype.tabbedviewEl = null;
+
+      // @property {jQuery} jQuery for the DOM element containing the tabs.
+      TabbedView.prototype.tabContainer = null;
+
+      // @property {jQuery} jQuery for the DOM element containing the pane.
+      TabbedView.prototype.paneContainer = null;
+
+      // @property {Pane} the active {Pane} or null.
+      TabbedView.prototype.activePane = null;
+
+      // @property {"left", "right", "top", "bottom", "center"} The side of the containing
+      //                {FlexSplit} in which this {TabbedView} is contained.
+      //                "center" if top-level.
+      TabbedView.prototype.splitSide = null;
+
+      // @property {FlexSplit} The parent {FlexSplit} containing this {TabbedView}.
+      TabbedView.prototype.containingSplit = null;
+
+      // DOM elements for tab status.
+      TabbedView.statusEl = {
+        none: TabbedView._faStatusEl(""),
+        success: TabbedView._faStatusEl(" fa-check"),
+        fail: TabbedView._faStatusEl(" fa-times"),
+        timeout: TabbedView._faStatusEl(" fa-regular fa-clock"),
+        working: TabbedView._faStatusEl(" fa-spinner fa-pulse"),
+        outdated: (() => {
+          var el, iconEl;
+          iconEl = TabbedView._faStatusEl(" fa-circle");
+          el = document.createElement("SPAN");
+          el.appendChild(iconEl);
+          el.appendChild(TabbedView._faStatusEl(""));
+          return el;
+        })(),
+        locked: TabbedView._faStatusEl(" fa-lock")
+      };
+
+      ref = TabbedView.statusEl;
+      // Identify each status element as such.
+      for (status in ref) {
+        el = ref[status];
+        el.className += " status-el";
+      }
+
+      return TabbedView;
+
+    }).call(this);
+    //TabbedView:: = $.extend {}, BladeComponent, FlexSplit.Child, module.config(), TabbedView::
+    Utils.extend(TabbedView, module.config());
+    Utils.extend(TabbedView, FlexSplit.Child, {
+      init: 1,
+      detachPanes: 1,
+      resize: 1
+    });
+    Utils.extend(TabbedView, BladeComponent);
+    return TabbedView;
+  });
+
+}).call(this);

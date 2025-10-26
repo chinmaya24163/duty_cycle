@@ -1,0 +1,330 @@
+(function() {
+
+  /*
+  A signal and its waveform.
+  TODO: Rename to Signal.
+  */
+  var $, SignalValue, Utils, Variable;
+
+  [$, Utils, SignalValue] = [];
+
+  Variable = (function() {
+    class Variable {
+      static staticInit(TSW, TF) {
+        Variable.TIME_SLOT_WIDTH = TSW;
+        return Variable.TRANSITION_FIELDS = TF;
+      }
+
+      /*
+      @param {WaveData} waveData the {WaveData}
+      @param {Number} width the width of the signal
+      @param {String} name the name of the signal
+      @param {String} nickname the vcd nickname representation of the signal
+      @param {String} scope the scope of the signal
+      @param {String} type the type of the signal
+      @param {String} ports the '[3:0]' representation of the bit range of this signal
+      */
+      constructor(waveData, width1, name, nickname, scope1, type, ports1, depth1) {
+        var c, char, conditionstr, index, indicies, scopeHeader, scopeTail;
+        this.waveData = waveData;
+        this.width = width1;
+        this.nickname = nickname;
+        this.scope = scope1;
+        this.type = type;
+        this.ports = ports1;
+        this.depth = depth1;
+        this.conditions = [];
+        this.cycle = null;
+        if (this.isTlvSig()) {
+          if (name.indexOf("?") === -1) {
+            if (name.indexOf("/") !== -1) {
+              this.notFullName = name.substring(name.lastIndexOf("/") + 1);
+            }
+            if (name.indexOf("@") > -1) {
+              this.notFullName = name.substring(name.indexOf("$"));
+              this.cycle = parseInt(name.substring(name.indexOf("@") + 1, name.lastIndexOf("$")));
+            } else {
+              this.notFullName = name;
+            }
+          } else {
+            // Process when conditions - TLV specific
+            // Signal names are provided as:
+            // [when conditions][stage][signal][range]
+            // Where,
+            //   [when conditions] contains "/" for each level of scope
+            //                     and ?$sig for each condition signal.
+            //   [stage] is the stage identifier, such as "@3"
+            //   [signal] is the TLV signal name, such as "$sig"
+            //   [range] is the bitrange of the signal provided by the simulator as
+            //           part of the SV signal name
+            // For example, a VCD with '$var' name:
+            //   >>?$valid?$cond>$foo[2:0]
+            // in scope:
+            //   >top>hier|pipe>trans
+            // represents signal:
+            //   >top>hier|pipe>trans$foo
+            // with bits [2:0]
+            // conditioned by:
+            //   >top>hier|pipe$valid and
+            //   >top>hier|pipe$cond.
+            this.fullName = name.substring(name.lastIndexOf("@"));
+            this.notFullName = name.substring(name.lastIndexOf("$"));
+            this.cycle = parseInt(name.substring(name.indexOf("@") + 1, name.lastIndexOf("$")));
+            conditionstr = name.substring(0, name.lastIndexOf("@"));
+            // scope string for condition signal, absorbed left-to-right as scope depth '>' are processed from signal name
+            scopeHeader = Variable.tlvTopScopeName; // start processing after tlvTopScopeName
+            // remaining unabsorbed scope
+            scopeTail = this.scope.substring(Variable.tlvTopScopeName.length);
+            //cycle through each when condition
+            while (conditionstr.length > 0) {
+              if (conditionstr.charAt(0) === "/") {
+                // Process a level of scope.
+                if (scopeTail.length === 0) {
+                  console.log("In when condition, tried to go too deep in scope");
+                }
+                // Find next identifier.
+                indicies = ((function() {
+                  var i, len, ref, results;
+                  ref = ["/", ">", "|"];
+                  results = [];
+                  for (i = 0, len = ref.length; i < len; i++) {
+                    char = ref[i];
+                    results.push(scopeTail.indexOf(char, 1));
+                  }
+                  return results;
+                })()).filter(function(x) {
+                  return x >= 0;
+                });
+                index = Math.min(...indicies, scopeTail.length);
+                scopeHeader += scopeTail.substring(0, index);
+                scopeTail = scopeTail.substring(index);
+                conditionstr = conditionstr.substring(1);
+              } else {
+                conditionstr = conditionstr.substring(1); //cut off leading ?
+                
+                // Find next identifier.
+                indicies = ((function() {
+                  var i, len, ref, results;
+                  ref = ["$", "?", "/"];
+                  results = [];
+                  for (i = 0, len = ref.length; i < len; i++) {
+                    char = ref[i];
+                    results.push(conditionstr.indexOf(char, 1));
+                  }
+                  return results;
+                })()).filter(function(x) {
+                  return x >= 0;
+                });
+                index = Math.min(...indicies, conditionstr.length);
+                c = conditionstr.substring(0, index);
+                conditionstr = conditionstr.substring(index);
+                this.conditions.push(scopeHeader + c);
+              }
+            }
+          }
+          this.fullName = (this.scope + this.notFullName).trim();
+        } else {
+          // SV signal
+          this.notFullName = name;
+          this.fullName = (((this.scope.length === 0) ? "" : this.scope + ".") + this.notFullName).trim();
+        }
+      }
+
+      /*
+      Does this signal exist.
+      @return false for the non-existent sentinal SignalValue only.
+      */
+      exists() {
+        return this.missing !== true;
+      }
+
+      /*
+      Set transitions, and anchors.
+      @param {Array} transitions
+      @param {Array} anchors
+      */
+      _setTransitions(transitions, anchors) {
+        this.transitions = transitions;
+        this.anchors = anchors;
+      }
+
+      /*
+      Get the value string at given time.
+      @param {int} time (within trace)
+      @return {String} value string
+      */
+      getValueAtCycle(cyc) {
+        return this.transitions[this.getTransIndexOfCycle(cyc) + 1];
+      }
+
+      /*
+      Get the value and its validity at the given cycle.
+      @param {Number} cyc (phase-granular) cycle within trace bounds
+      @return {[String, boolean]} value string and its validity
+      */
+      getValueAndValidAtCycle(cyc) {
+        var transIndex;
+        transIndex = this.getTransIndexOfCycle(cyc);
+        return [this.transitions[transIndex + 1], this.transitions[transIndex + 2]];
+      }
+
+      /*
+      Get the index into transitions array that produces the value at the given cycle (by indexing into anchors,
+      and searching forward).
+      @param {Number} cyc the (phase-granular) cycle (within trace bounds)
+      @return {int} index into transitions array (can be one transition before first, or
+                    last transition if after last
+      */
+      getTransIndexOfCycle(cyc) {
+        var nextCycle, nextIndex, transIndex;
+        if (cyc < this.waveData.startCycle) {
+          return -SignalValue.TRANSITION_FIELDS; // Transition before first.
+        }
+        if (cyc >= this.waveData.lastCycle) {
+          return this.transitions.length - SignalValue.TRANSITION_FIELDS; // Last transition.
+        }
+        transIndex = this.anchors[Math.floor((cyc - this.waveData.startCycle) / Variable.TIME_SLOT_WIDTH)];
+        while (true) {
+          nextIndex = transIndex + SignalValue.TRANSITION_FIELDS;
+          nextCycle = this.transitions[nextIndex];
+          if (typeof nextCycle === "undefined" || nextCycle > cyc) {
+            break;
+          }
+          transIndex = nextIndex;
+        }
+        return transIndex;
+      }
+
+      /*
+      makes a Variable from a line of vcd and current scope
+      @param {Array<String>} c line of a .vcd file declaring a variable, which is in array format split by word
+      @param {String} scope the current scope
+      @return {Variable}
+      */
+      static _makeVar(wd, c, scope, depth) {
+        var e, ports, v, width;
+        ports = c.length > 4 ? c[4] : null;
+        try {
+          width = parseInt(c[1]);
+        } catch (error) {
+          e = error;
+          console.log(`Error parsing width (${c[1]}) of signal ${c[3]}: `, e);
+          width = 1;
+        }
+        return v = new Variable(wd, width, c[3], c[2], scope, c[0], ports, depth);
+      }
+
+      isTlvSig() {
+        return this.scope.startsWith(Variable.tlvTopScopeName);
+      }
+
+      /*
+      Get a value string in a timing-abstract way, meaning, at a given stage and cycle.
+      @param {int} cyc (within trace)
+      @param {int} stage (within pipeline)
+      @return {String} value string or undefined if outside trace bounds
+      */
+      getValueAtCycleAndStage(cyc, stage) {
+        cyc = cyc - stage + this.cycle;
+        if (cyc > this.waveData.endCycle || cyc < this.waveData.startCycle) {
+          return void 0;
+        }
+        return this.transitions[this.getTransIndexOfCycle(cyc) + 1];
+      }
+
+      /*
+      Get the value and its validity in a timing-abstract way, meaning, at the given stage and cycle.
+      @param {Number} cyc (phase-granular) cycle within trace bounds
+      @param {Number} stage (phase-granular) stage within pipeline bounds
+      @return {[String, boolean]} value string and its validity;
+                 value is undefined if outside trace bounds;
+                 validity is undefined if either value or its condition signal are
+                 outside trace bounds
+      */
+      getValueAndValidAtCycleAndStage(cyc, stage) {
+        var transIndex;
+        cyc = cyc - stage + this.cycle;
+        if (cyc > this.waveData.endCycle || cyc < this.waveData.startCycle) {
+          return [void 0, void 0];
+        }
+        transIndex = this.getTransIndexOfCycle(cyc);
+        return [this.transitions[transIndex + 1], this.transitions[transIndex + 2]];
+      }
+
+    };
+
+    // @property {WaveData} waveData the WaveData.
+    Variable.prototype.waveData = null;
+
+    // @property {Array<Variable>} conditions signals that condition this signal (initially this is assigned
+    //                                        to strings of full condition signal names).
+    Variable.prototype.conditions = null;
+
+    // @property {Number} cycle the pipe cycle this signal is assigned in TODO: Should be "pipestage"
+    Variable.prototype.cycle = null;
+
+    // @property {Number} width the width of the signal in bits
+    Variable.prototype.width = null;
+
+    // @property {String} notFullName the name of the signal
+    Variable.prototype.notFullName = null;
+
+    // @property {"wire", ...} type the type of the signal as defined in the VCD file. TODO: need full definititon
+    Variable.prototype.type = null;
+
+    // @property {String} nickname the vcd nickname for this signal
+    Variable.prototype.nickname = null;
+
+    // @property {String} full name (scope and name) of this signal
+    Variable.prototype.fullName = null;
+
+    // @property {String} scope the scope this signal is in
+    Variable.prototype.scope = null;
+
+    // @property {String} ports the [31:0] representation of the bit range of this signal
+    Variable.prototype.ports = null;
+
+    // @property {Number} depth the scope depth of this signal
+    Variable.prototype.depth = null;
+
+    /*
+    @property {Array} waveform data in the form:
+    [ <cycle>,  # Cycle number of the transition
+      <value-str>, # As in VCD file.
+      <valid>,  # Boolean or undefined (for conditions outside trace). (Note, this is wasted space
+     * for signals w/o conditions, including all SV signals.)
+      (repeat)
+    ]
+    Presumably, using a flat array is optimal for storage and lookup time.
+     */
+    Variable.prototype.transitions = null;
+
+    /*
+    @property {Array<int>} Course-grained indexing into @transitions by time.
+                           The value of a signal at cycle X can be found by
+                           starting at transitions[anchors[(X - @waveData.startCycle) / TIME_SLOT_WIDTH]]
+                           and scanning forward.
+    */
+    Variable.prototype.anchors = null;
+
+    // @property {Number} As in WaveData
+    Variable.TIME_SLOT_WIDTH = null;
+
+    // @property {int} As in WaveData.
+    Variable.TRANSITION_FIELDS = null;
+
+    Variable.tlvTopScopeName = "TLV";
+
+    return Variable;
+
+  }).call(this);
+
+  define(function(require, exports, module) {
+    $ = require("jquery");
+    Utils = require("Utils");
+    SignalValue = require("VCD/SignalValue");
+    $.extend(Variable.prototype, module.config());
+    return Variable;
+  });
+
+}).call(this);

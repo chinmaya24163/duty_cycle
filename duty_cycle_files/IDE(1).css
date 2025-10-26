@@ -1,0 +1,257 @@
+/*
+Copyright (c) Redwood EDA, LLC
+See accompanying LICENSE file for details.
+*/
+
+#title {
+  width: 100%;
+  height: 32px;
+  background: black;
+  color: white;
+  text-align: center;
+  padding: 4px;
+  font-size: 24px;
+}
+
+
+
+.tlx_except_node_anchor {
+  position: relative;
+  z-index: 5;
+  pointer-events: none;
+  top: 0px;
+  left: 0px;
+}
+
+.tlx_except_container {
+  position: absolute;
+  z-index: 5;
+  top: 0px;
+  left: 0px;
+}
+
+.tlx_except_anchor {
+  position: relative;
+  z-index: 5;
+  top: 0px;
+  left: 0px;
+}
+
+.tlx_except_hover {
+  position: absolute;
+  z-index: 10;
+}
+.tlx_except {
+  position: absolute;
+  z-index: 5;
+  pointer-events: auto;
+  /*text-decoration: underline;  / * Could put the underline in .tlx_except_hover so it is above the text. --disabled because it doesn't look good with value annotation */
+  color: red;
+  background: rgba(255, 0, 0, 0.3); /* #f0c0c0; */
+}
+// Provide appropriate color based on Severity for anything other than default of red, above.
+.tlx_except:sev(inform) {
+  color: yellow;
+  background: rgba(255, 255, 0.3); /* #f0f0c0; */
+}
+.tlx_except:sev(warning) {
+  color: orange;
+  background: rgba(255, 220, 200, 0.3);  /* #f0d8c0; */
+}
+
+
+
+
+html, body, div {
+	margin: 0;
+	border: 0;
+	padding: 0;
+}
+
+html, body {
+	height: 100%;
+	min-height: 100%;
+	width: 100%;
+}
+
+body {
+	display: table;
+	border: 0;
+}
+
+table, tr, td {
+	border-spacing: 0;
+	padding: 0;
+	border: 0;
+	margin: 0;
+}
+
+/* Nav Bar */
+
+#banner {
+	width: 100%;
+	display: table-row;
+}
+#nav-bar {
+	margin: 0px;
+	border: 4px outset #c88459;
+	padding: 4px;
+	background-image: url("images/woodgrain.jpg");
+	coloyr: black;
+}
+#nav-bar p {
+	position: relative;
+	top: -1px;
+	display: inline;
+	padding: 2px;
+}
+#redwoodeda, #redwoodeda a {
+	position: relative;
+	top: 1px;
+	padding-right: 15px;
+	font: bold 28px Georgia, serif;
+	text-shadow: 1px 1px #CF8772;
+	text-decoration: none;
+	color: #450F00;
+}
+#redwoodeda a:hover {
+	color: #AB1C02;
+}
+#confidential_header {
+	position: relative;
+	top: 1px;
+	padding-right: 5px;
+	font: bold 28px Georgia, serif;
+	text-decoration: none;
+	color: #900000;
+}
+#nav-header {
+	color: black;
+	font: 22px "Trebuchet MS", Helvetica, sans-serif
+}
+#nav-controls {
+	color: black;
+	font: 14px "Trebuchet MS", Helvetica, sans-serif
+}
+
+
+/* Trim */
+.trim {
+	background-image: url("images/background_woodgrain.jpg");
+}
+.trim.verticle {
+	min-width: 5px;
+	border: 1px outset #B17B57;
+}
+#bottom-trim-row {
+	height: 8px;
+	display: table-row;
+}
+#bottom-trim {
+	display: table-cell;
+	border: 1px outset #B17B57;
+	background-image: url("images/background_woodgrain.jpg");
+}
+
+
+/* Split Pane */
+
+#non-header {
+	height: 100%;
+	width: 100%;
+	margin: 0;
+	border: 0;
+	padding: 0;
+	display: table-row;
+}
+
+#split-pane {
+	height: 100%;
+	width: 100%;
+}
+
+.split-pane-component {
+	height: 100%;
+	background: #A5A5A5;
+}
+
+#left-component {
+	height: 100%;
+	width: 100%;
+	overflow: hidden;
+	width: 430px; /* Same as divider left */
+}
+
+#my-divider {
+	height: 100%;
+	width: 100%;
+	left: 430px;
+	width: 7px;
+	background-image: url("images/background_woodgrain.jpg");
+	border: 1px outset #B17B57;
+	position: absolute;
+	top: -1px;
+}
+
+#right-component {
+	height: 100%;
+	left: 430px; /* Same as divider left */
+	margin: 0px 0px 0px 7px; /* Same as divider width */
+	overflow: hidden;
+}
+
+.slider-tick-mark {
+	width: 1px;
+	height: 17px;
+	background: #D5BE8D;
+	position: absolute;
+	top: -8px;
+}
+
+
+.loading {
+	position: absolute;
+	left: 20px;
+	top: 40%;
+	color: white;
+	font: normal 40px/60px Arial, Helvetica, sans-serif;
+	z-index: -1;
+}
+
+#editor_container {
+  height: 100%;
+}
+
+.CodeMirror {
+  height: 100%;
+}
+
+
+
+body,html {
+  height: 100%;
+}
+#body_container {
+  left: 0px;
+  top: 0px;
+  height: auto;
+}
+#nav_code,#graph,#log {
+  width: 100%;
+  height: 100%;
+  padding: 0px;
+  margin: 0px;
+  border: 0px;
+  position: absolute;
+  left: 0px;
+  top: 0px;
+  float: left;
+  background: white;
+  overflow: scroll;
+}
+#code {
+  overflow: scroll;
+}
+#graph {
+  overflow: hidden;
+}

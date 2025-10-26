@@ -1,0 +1,317 @@
+(function() {
+  define("Graph", function(require, exports, module) {
+    /*
+    A module that displays the result of compilation as a graph.
+
+    @extend Pane
+    @extend ModuleConfigObject
+    @extend ModelViewSync
+
+    */
+    var $, Graph, Logging, ModelViewSync, Pane, Promise, ScrollWrapper, SignalValue, Utils;
+    ModelViewSync = require("ModelViewSync");
+    $ = require("jquery");
+    Utils = require("Utils");
+    Promise = require("bluebird");
+    Logging = require("Logging");
+    Pane = require("Pane");
+    SignalValue = require("VCD/SignalValue");
+    ScrollWrapper = require("ScrollWrapper");
+    Graph = (function() {
+      /*
+      Sets up compiler event handlers.
+      @param {SandPiperCompiler} compiler The compiler to listen to.
+      @return Graph
+      */
+      var SVGPending;
+
+      class Graph extends Pane {
+        init(name, ide, project, tabbedview) {
+          return this.initPane("Graph", name, ide, project, tabbedview, {}, true).then(() => {
+            this.enableTimestamp();
+            this.content = new Graph.Content(this);
+            this.isLive = false;
+            return this;
+          });
+        }
+
+        myGoDead() {
+          return this.resetSignalColor();
+        }
+
+        myGoLive() {
+          return this.updateSignalColor();
+        }
+
+        /*
+        Highlights the signals with the given logical entity in the graph
+        @param {String} le the logical entity to highlight
+        */
+        _highlightLogicalElement(le) {
+          var element;
+          element = $(`[logical_entity='${le}']`, this.contentContainerEl);
+          element.find("[stroke]").addClass("highlight");
+          return element.each(function(index, singleElement) {
+            var $singleElement;
+            $singleElement = $(singleElement);
+            if (!$singleElement.is("g.node")) {
+              $singleElement.find("text").addClass("highlighted-value");
+              if ($singleElement.is("g.edge")) {
+                return $singleElement.find("polygon").addClass("highlighted-value");
+              }
+            }
+          });
+        }
+
+        // $("[logical_entity='#{le}']", @contentContainerEl).find("[stroke]").addClass "highlight"
+        /*
+        Unhighlights all signals in the prah
+        */
+        _unhighlightLogicalElements() {
+          $("[logical_entity] .highlight", this.contentContainerEl).removeClass("highlight");
+          return $("[logical_entity] .highlighted-value", this.contentContainerEl).removeClass("highlighted-value");
+        }
+
+        updateCycle(newCyc) {
+          this.cyc = newCyc;
+          if (this.isLive) {
+            return this.updateSignalColor();
+          }
+        }
+
+        compiler(compiler) {
+          compiler.on("graph", (svg) => {
+            SVGPending = false;
+            this.content.newSVG(svg);
+            return this.updateSignalColor(); // (returns immediately if no wave data)
+          });
+          compiler.on("graphviz/done", (data) => {
+            if (data.success === "success") {
+              return this.setStatus("success");
+            }
+            return this.setStatus(data.timeout ? "timeout" : "fail");
+          });
+          compiler.on("vcd", (data) => {
+            // It's probabaly best to clear the SVG if we haven't received new SVG yet.
+            // (@setWaveData(data.wd) will update whatever SVG we have.)
+            if (SVGPending) {
+              this.contentContainerEl.children("svg").empty();
+            }
+            // Register the new VCD data
+            return this.setWaveData(data.wd);
+          });
+          compiler.on("newcompile", () => {
+            SVGPending = true;
+            this.setStatus("working");
+            // Since the wavedata comes back separately from the graph, and we don't want them to
+            // be out of sync, we invalidate the wavedata when a new compile is started.
+            // We also update the DOM to reflect no wavedata (until new data arrives).
+            this.setWaveData(null);
+            if (this.isLive) {
+              return this.resetSignalColor();
+            }
+          });
+          return this;
+        }
+
+        /*
+        Reflects signal values for @cyc in the diagram.
+        This must undo any previous coloring/values.
+        */
+        updateSignalColor() {
+          var signalElements, space, svgEl;
+          if (!this.isLive) {
+            return;
+          }
+          if (!this.waveData) {
+            return;
+          }
+          svgEl = this.contentContainerEl.children("svg");
+          signalElements = svgEl.find("[logical_entity]");
+          space = 10; // 10 chars max.
+          return signalElements.each((index, element) => {
+            var baseSignalName, bitWidth, blue, blueComponent, color, colorSignal, colorSignalName, green, greenComponent, isColorSignal, isConditional, logicalEntity, maxValue, normalizedValue, orangeColor, pathEl, purpleColor, red, redComponent, ref, rgbValue, signal, stage, text, title, valid, value;
+            logicalEntity = $(element).attr("logical_entity");
+            if (logicalEntity) {
+              // Construct the base signal name by prefixing with "TLV"
+              baseSignalName = "TLV" + logicalEntity;
+              // Try with $color replacement first if it's an $ANY signal, If $color version exists, treat as color signal. Otherwise fall back to original $ANY signal
+              if (baseSignalName.endsWith("$ANY")) {
+                colorSignalName = baseSignalName.replace(/\$ANY$/, "$color");
+                colorSignal = this.waveData.getSignalByName(colorSignalName);
+                if (colorSignal != null) {
+                  baseSignalName = colorSignalName;
+                }
+              }
+              signal = this.waveData.getSignalByName(baseSignalName);
+              stage = $(element).attr("cycle_number");
+              if (signal) {
+                [value, valid] = signal.getValueAndValidAtCycleAndStage(this.cyc, stage);
+                if ((value != null) && valid) {
+                  [text, title] = SignalValue.representValue(signal.type, value, signal.width, valid, space);
+                  pathEl = $(element).find("path[stroke]");
+                  isConditional = ((ref = pathEl.attr("stroke-dasharray")) != null ? ref.length : void 0) > 0; // or pathEl.attr("stroke") is "#e04010"
+                  isColorSignal = baseSignalName.endsWith("$color");
+                  if (isColorSignal && parseInt(signal.width) === 24) {
+                    // Convert binary string to RGB components:
+                    // Format: RRRRRRRRGGGGGGGGBBBBBBBB (8 bits per channel)
+                    rgbValue = parseInt(value.toString(), 2);
+                    red = (rgbValue >> 16) & 0xFF;
+                    green = (rgbValue >> 8) & 0xFF;
+                    blue = rgbValue & 0xFF;
+                    color = `rgb(${red}, ${green}, ${blue})`;
+                    return $(element).find("[stroke]").css("stroke", color).removeClass("invalid-signal");
+                  } else {
+                    // NORMALIZE SIGNAL VALUE FOR COLOR GRADIENT:
+                    // Convert value to 0-1 range for consistent coloring regardless of bit width
+                    bitWidth = signal.width;
+                    maxValue = Math.pow(2, bitWidth) - 1;
+                    value = parseInt(value.toString(), 2);
+                    normalizedValue = value / maxValue;
+                    if (isConditional) {
+                      redComponent = Math.round(200 + (normalizedValue * 55));
+                      greenComponent = Math.round(80 + (normalizedValue * 40));
+                      orangeColor = `rgb(${redComponent}, ${greenComponent}, 0)`;
+                      return $(element).find("[stroke]").css("stroke", orangeColor).removeClass("invalid-signal").removeClass("replicated-signal");
+                    } else {
+                      redComponent = Math.round(102 + (normalizedValue * 42));
+                      blueComponent = Math.round(170 - (normalizedValue * 42));
+                      purpleColor = `rgb(${redComponent}, 0, ${blueComponent})`;
+                      $(element).find("[stroke]").css("stroke", purpleColor).removeClass("invalid-signal").removeClass("replicated-signal");
+                      if ($(element).is("g.edge")) {
+                        return $(element).find("text").text(text).css("fill", purpleColor);
+                      }
+                    }
+                  }
+                } else {
+                  // .css("font-family", "Consolas, monospace")
+                  if (value == null) {
+                    console.error("Signal lookup failed for:", baseSignalName, "at cycle:", cyc, "and stage:", stage);
+                    // using red for undefined values
+                    $(element).find("[stroke]").css("stroke", "red").addClass("invalid-signal").removeClass("replicated-signal");
+                  } else {
+                    // Just invalid but not undefined
+                    $(element).find("[stroke]").addClass("invalid-signal").removeClass("replicated-signal");
+                  }
+                  if ($(element).is("g.edge")) {
+                    return $(element).find("text").text(text).css("fill", "gray");
+                  }
+                }
+              } else {
+                // .css("font-family", "Consolas, monospace")
+                if ($(element).is("g.edge")) {
+                  return $(element).find("[stroke]").addClass("replicated-signal").removeClass("invalid-signal");
+                }
+              }
+            }
+          });
+        }
+
+        /*
+        Updates the diagram to a non-live state (no signal values).
+        */
+        resetSignalColor() {
+          var signalElements, svgEl;
+          svgEl = this.contentContainerEl.find('svg');
+          signalElements = svgEl.find("[logical_entity]");
+          return signalElements.each(function(index, element) {
+            $(element).find("[stroke]").css("stroke", "").removeClass("invalid-signal").removeClass("replicated-signal");
+            if ($(element).hasClass("edge")) {
+              return $(element).find("text").text("");
+            }
+          });
+        }
+
+      };
+
+      SVGPending = false;
+
+      return Graph;
+
+    }).call(this);
+    /*
+    Scalable graph contents.
+    @extend Pane.ScalableSVG
+    TODO: Use proper inheritance.
+    */
+    Graph.Content = class Content extends Pane.ScalableSVG {
+      constructor(pane) {
+        super(pane);
+        this.construct(pane);
+      }
+
+      /*
+      Sets the bounds of the SVG content.
+
+      Graphviz draws the graph with the following properties (example below):
+        Graph is within graph coords (0, -y-size), (x-size, 0)
+        Note that Y coordinates are all negative, X coordinates are all positive
+        The <svg ...> width and height match the viewbox width and height,
+        where the viewbox coordinates and are (0, 0) (x-size + 8, y-size + 8).
+        The graph is translated to center it without including the 4-pixel padding.
+
+      Example:
+        <svg width="1176pt" height="2052pt"
+        viewBox="0.00 0.00 1176.00 2052.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+        <g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 2048)">
+
+      Pane.ScalableSVG reassigns viewbox and translation attributes differently
+      (to have user coords (0,0) in its center for easier zooming). We just need
+      to extract the bounds of graph content under the assumptions above. We do so
+      with 4-pixel padding.
+
+      */
+      setBounds(viewBox) {
+        return this.userBounds.set(-4, -(viewBox.height - 4), viewBox.width, viewBox.height);
+      }
+
+      /*
+      Initialize bindings for new graph content.
+      */
+      initContent() {
+        /*
+        Listens to clicks on the background of the graph, and un-highlights the current logical element.
+        Rejects if the click event is related to a drag (`@dragging`), if the click is on one of the zoom buttons
+        (`[data-Diagram-zooming]`), or on another logical entity (see the seperate click listener for `[logical_entity]`).
+        Entire listener is a hack.
+        */
+        this.contentContainerEl.on("click", (e) => {
+          if (this.pane.dragging || !this.contentValid) {
+            return;
+          }
+          if ($(e.target).parents("[data-diagram-zooming]").length > 0) {
+            return;
+          }
+          if ($(e.target).attr("logical_entity") || $(e.target).parents("[logical_entity]").attr("logical_entity")) {
+            return;
+          }
+          e.preventDefault();
+          return this.pane.unhighlightLogicalElements();
+        });
+        // Highlighting - Use the control key to select multiple entities
+        return this.contentContainerEl.on("click", "[logical_entity]", (e) => {
+          var le;
+          if (this.pane.dragging || !this.contentValid) {
+            return;
+          }
+          le = $(e.target).parents("[logical_entity]").last().attr("logical_entity");
+          if (!le) {
+            return;
+          }
+          e.preventDefault();
+          return this.pane.highlightLogicalElement(le, e.ctrlKey);
+        });
+      }
+
+    };
+    Utils.extend(Graph, Pane.Steppable);
+    Utils.extend(Graph, Pane.Scalable);
+    Utils.extend(Graph, module.config(), true, true);
+    Utils.extend(Graph, ModelViewSync, {
+      _highlightLogicalElement: 1,
+      _unhighlightLogicalElements: 1
+    });
+    return Graph;
+  });
+
+}).call(this);

@@ -1,0 +1,172 @@
+(function() {
+  define("ModelViewSync", function(require, exports) {
+    /*
+    A module that synchronizes highlighting and other model attributes across other modules.
+
+    @mixin
+
+    @example Extend ModelViewSync
+      class MyView
+
+        constructor: ->
+          $("#myview [data-logicalelement]").click (e) ->
+            @highlightLogicalElement $(e.target).data("localelement")
+
+        _highlightLogicElement: (el) -> $("#myview [data-logicalelement='#{el}']").css(...)
+
+        _unhighlightLogicalElements: (el) -> ($"#myview [data-logicalelement]").css(...)
+
+      Utils.extend(MyView, ModelViewSync::, {_highlightLogicalElement: 1, _unhighlightLogicalElements: 1})
+
+    @example Create ModelViewSync instances with a defined modelViews variable
+
+      init = ->
+        modelViews = []
+        view1 = new MyView()
+        view2 = new MyView()
+        view1.modelViews modelViews
+        view2.modelViews modelViews
+
+    @example Create ModelViewSync instances without a named variable
+
+      init = ->
+        view1 = new MyView()
+        view2 = new MyView()
+        view1.modelViews(view2.modelViews())
+    */
+    var ModelViewSync;
+    ModelViewSync = {
+      // @property {Array<ModelViewSync>} Other {ModelViewSync} instances to synchronize with
+      _modelViews: null,
+      /*
+      Initializes synchronizing details in models.
+      @param {Array<ModelViewSync>} **Optional** views other {ModelViewSync} instances to synchronize with.
+        Defaults to an empty array that can be passed to other {ModelViewSync} instances or saved as a variable.
+      @return {Array<ModelViewSync>} an array of {ModelViewSync} instances, including this one
+      */
+      modelViews: function(views = []) {
+        views.push(this);
+        return this._modelViews = views;
+      },
+      /*
+      Highlight logical elements across all views.
+      @param [String] el the unique identifier for a logical element
+      @param [Boolean] remainHiglighted **Optional** `true` to prevent previous highlights to be removed.
+        Defaults to `false`.
+      */
+      highlightLogicalElement: function(el, remainHiglighted = false) {
+        var i, len, ref, results, view;
+        if (!remainHiglighted) {
+          this.unhighlightLogicalElements();
+        }
+        if (this._modelViews) {
+          ref = this._modelViews;
+          results = [];
+          for (i = 0, len = ref.length; i < len; i++) {
+            view = ref[i];
+            if (view._highlightLogicalElement) {
+              results.push(view._highlightLogicalElement(el));
+            }
+          }
+          return results;
+        }
+      },
+      /*
+      Highlights an entire behavioral hierarchy across all views.  Highlights as a logical element if the view doesn't
+      support highlighting an entire hierarchy.
+      @param [String] el the unique identifier for a hierarchy
+      @param [Boolean] remainHiglighted **Optional** `true` to prevent previous highlights to be removed.
+        Defaults to `false`.
+      */
+      highlightBehHier: function(el, remainHiglighted = false) {
+        var i, len, ref, results, view;
+        if (!remainHiglighted) {
+          this.unhighlightBehHiers();
+        }
+        if (!this._modelViews) {
+          return;
+        }
+        ref = this._modelViews;
+        results = [];
+        for (i = 0, len = ref.length; i < len; i++) {
+          view = ref[i];
+          if (!(view._highlightBehHier && view._highlightBehHier(el))) {
+            results.push(view._highlightLogicalElement(el));
+          } else {
+            results.push(void 0);
+          }
+        }
+        return results;
+      },
+      /*
+      Unhighlight all behavioral hierarchies across all views.
+      */
+      unhighlightBehHiers: function() {
+        var i, len, ref, results, view;
+        if (!this._modelViews) {
+          return;
+        }
+        ref = this._modelViews;
+        results = [];
+        for (i = 0, len = ref.length; i < len; i++) {
+          view = ref[i];
+          if (!(view._unhighlightBehHiers && view._unhighlightBehHiers())) {
+            results.push(view._unhighlightLogicalElements());
+          } else {
+            results.push(void 0);
+          }
+        }
+        return results;
+      },
+      /*
+      Unhighlight all logical elements across all views.
+      */
+      unhighlightLogicalElements: function() {
+        var i, len, ref, results, view;
+        if (this._modelViews) {
+          ref = this._modelViews;
+          results = [];
+          for (i = 0, len = ref.length; i < len; i++) {
+            view = ref[i];
+            if (view._unhighlightLogicalElements) {
+              results.push(view._unhighlightLogicalElements());
+            }
+          }
+          return results;
+        }
+      },
+      /*
+      Highlights a logical element in this module
+      @param [String] el the unique identifier for a logical element
+      @abstract Replace with specifics to your module.
+      */
+      _highlightLogicalElement: function(el) {
+        return void 0;
+      },
+      /*
+      Unhighlights all logical elements in this module
+      @abstract Replace with specifics to your module.
+      */
+      _unhighlightLogicalElements: function() {
+        return void 0;
+      },
+      /*
+      Highlights a behavioral hierarchy in this module.
+      @param [String] el the unique indentifier for a behavioral hierarchy
+      @abstract Replace with specfics to your module.
+      */
+      _highlightBehHier: function(el) {
+        return void 0;
+      },
+      /*
+      Unhighlights all behavioral hierarchies in this module
+      @abstract Replace with specifics to your module.
+      */
+      _unhighlightBehHiers: function() {
+        return void 0;
+      }
+    };
+    return ModelViewSync;
+  });
+
+}).call(this);

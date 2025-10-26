@@ -1,0 +1,15 @@
+# Read your design
+read_verilog duty_cycle.v
+
+# Elaborate top module
+# Replace "duty_cycle" if your top module has a different name
+hierarchy -top duty_cycle
+
+# Check the design for errors
+proc; opt; check
+
+# Synthesize to generic gates (ABC)
+synth -top duty_cycle
+
+# Write the netlist in Verilog format
+write_verilog duty_cycle_synth.v

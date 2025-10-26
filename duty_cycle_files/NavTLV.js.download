@@ -1,0 +1,294 @@
+(function() {
+  var boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  define("NavTLV", function(require, exports, module) {
+    /*
+    A module that displays an HTML representation of the TLV code from simulation (colored for navigation)
+
+    @extend Pane
+    @extend ModuleConfigObject
+    */
+    var $, Logging, ModelViewSync, NavTLV, Pane, ScrollWrapper, SignalValue, Utils;
+    Pane = require("Pane");
+    ModelViewSync = require("ModelViewSync");
+    $ = require("jquery");
+    Utils = require("Utils");
+    Logging = require("Logging");
+    SignalValue = require("VCD/SignalValue");
+    ScrollWrapper = require("ScrollWrapper");
+    NavTLV = (function() {
+      class NavTLV extends Pane {
+        constructor() {
+          super(...arguments);
+          /*
+          Populates the navtlv into the DOM.
+          @param {String} navtlv The value to set as navtlv
+          @return NavTLV
+          */
+          this.navtlv = this.navtlv.bind(this);
+        }
+
+        init(name, ide, project, tabbedview) {
+          return this.initPane("NavTLV", name, ide, project, tabbedview, {
+            "navtlv": ""
+          }).then(() => {
+            this.enableTimestamp();
+            return this;
+          });
+        }
+
+        updateCycle(newCyc) {
+          this.cyc = newCyc;
+          if (this.isLive) {
+            return this.updateValueSpans(this.cyc);
+          }
+        }
+
+        myGoDead() {
+          if (typeof this.hideValueSpans === "function") {
+            this.hideValueSpans();
+          }
+          return this.resetNavTlvSpecificElements();
+        }
+
+        myGoLive() {
+          var currentScrollTop, lineHeightExpanded, lineHeightNormal, newScrollTop, scrollEl, topLineNumber;
+          scrollEl = Utils.$one(">[data-navtlv]>[data-navtlv-scroll]", this.paneEl);
+          // Calculate the current topmost visible line number
+          currentScrollTop = scrollEl.scrollTop();
+          lineHeightNormal = 24; // Line height
+          topLineNumber = Math.floor(currentScrollTop / lineHeightNormal) + 1;
+          if (typeof this.updateValueSpans === "function") {
+            this.updateValueSpans(this.cyc);
+          }
+          if (typeof this.showValueSpans === "function") {
+            this.showValueSpans();
+          }
+          this.addNavTlvSpecificElements();
+          // Adjust scroll position to keep the same top line in view
+          lineHeightExpanded = 40; // Approx. line height in live mode (2.5em, roughly 40px at 16px font-size)
+          newScrollTop = (topLineNumber - 1) * lineHeightExpanded;
+          return scrollEl.scrollTop(newScrollTop);
+        }
+
+        resetNavTlvSpecificElements() {
+          Utils.$one("[data-navtlv-code]", this.paneEl).removeClass("expanded-lines");
+          return Utils.$one("[data-navtlv-linenums]", this.paneEl).removeClass("expanded-lines");
+        }
+
+        addNavTlvSpecificElements() {
+          Utils.$one("[data-navtlv-code]", this.paneEl).addClass("expanded-lines");
+          return Utils.$one("[data-navtlv-linenums]", this.paneEl).addClass("expanded-lines");
+        }
+
+        updateValueSpans(cyc = 0) {
+          var logicalEntities;
+          if (!this.waveData) {
+            return;
+          }
+          logicalEntities = $("span[logical_entity]", this.paneEl);
+          return logicalEntities.each((index, element) => {
+            var $el, $valueSpan, baseSignalName, logicalEntity, phase_number, result, signal, space, stage_in_phases, text, title, valid, value;
+            $el = $(element);
+            logicalEntity = $el.attr("logical_entity");
+            stage_in_phases = $el.attr("stage_in_phases");
+            if (logicalEntity) {
+              baseSignalName = "TLV" + logicalEntity;
+              phase_number = stage_in_phases >> 1;
+              $valueSpan = $el.find('.value');
+              if ($valueSpan.length > 0) {
+                signal = this.waveData.getSignalByName(baseSignalName);
+                if ($el.hasClass("tlv_ident_assigned_pipe_sig") || $el.hasClass("tlv_ident_pipe_sig")) {
+                  if (signal) {
+                    result = signal.getValueAndValidAtCycleAndStage(cyc, phase_number);
+                    [value, valid] = result;
+                    if (!result || value === void 0) {
+                      console.error("Signal lookup failed for:", baseSignalName, "at cycle:", cyc, "and stage:", phase_number);
+                      $valueSpan.text("*").attr("title", "Signal lookup failed");
+                      return;
+                    }
+                    space = 10 * 8;
+                    [text, title] = SignalValue.representValue(signal.type, value, signal.width, valid, space);
+                    return $valueSpan.text(text).attr("title", title);
+                  } else {
+                    return $valueSpan.text("*").attr("title", "No signal data");
+                  }
+                } else {
+                  return $valueSpan.text(" ").attr("title", "No signal data");
+                }
+              }
+            }
+          });
+        }
+
+        showValueSpans() {
+          return $(".value-wrapper", this.paneEl).show();
+        }
+
+        hideValueSpans() {
+          return $(".value-wrapper", this.paneEl).hide();
+        }
+
+        navtlv(navtlv) {
+          var bindClick, el, highlightEl, i, j, len, lineEls, linenumsEl, logicalEntities, num, scrollEl, source_line_num;
+          boundMethodCheck(this, NavTLV);
+          this.setStatus("success");
+          Utils.$one("[data-navtlv-code]", this.paneEl).html(navtlv);
+          Utils.$one("[data-navtlv-linenums]", this.paneEl).html("");
+          Utils.$one("[data-navtlv-highlight]", this.paneEl).html("");
+          lineEls = $("[source-line-num]", $("[data-navtlv-code] >pre", this.paneEl));
+          scrollEl = this.paneEl.find("> [data-navtlv] > [data-navtlv-scroll]");
+          linenumsEl = scrollEl.find("> [data-navtlv-linenums]");
+          highlightEl = scrollEl.find("> [data-navtlv-highlight]");
+          // Hack the DOM to add line numbers.
+          i = 0;
+          for (j = 0, len = lineEls.length; j < len; j++) {
+            el = lineEls[j];
+            i++;
+            source_line_num = el.getAttribute("source-line-num");
+            num = $("<pre class=\"no-select\">").text(`${i}`);
+            num.mouseenter((e) => {
+              i = $(e.target).parent().data("navtlv-linenum");
+              return $(`[data-navtlv-highlight-line='${i}']`, this.paneEl).css("background-color", "rgba(255, 252, 0, 0.2)");
+            });
+            num.mouseout((e) => {
+              i = $(e.target).parent().data("navtlv-linenum");
+              return $(`[data-navtlv-highlight-line='${i}']`, this.paneEl).css("background-color", "transparent");
+            });
+            num.click((e) => {
+              i = $(e.target).parent().data("navtlv-source-line-num");
+              this._editor.activate();
+              return this._editor.setCursor(i - 1, 0);
+            });
+            linenumsEl.append($(`<div data-navtlv-linenum='${i}' data-navtlv-source-line-num='${source_line_num}'></div>`).append(num));
+            highlightEl.append($(`<div data-navtlv-highlight-line='${i}'><pre>&nbsp;</pre></div>`));
+          }
+          logicalEntities = $("span[logical_entity]", this.paneEl);
+          logicalEntities.each(function(index, element) {
+            var $el, valueSpan, wrapper;
+            $el = $(element);
+            valueSpan = $("<span class='value'></span>");
+            wrapper = $("<span class='value-wrapper'></span>").append(valueSpan);
+            return $el.append(wrapper);
+          });
+          bindClick = () => {
+            $(`#${this.path} [data-navtlv-code]`).on("click", "[logical_entity]", (e) => {
+              var le;
+              le = $(e.target).attr("logical_entity");
+              // console.log "Clicked on #{le}"
+              if (($(e.target).is(".tlv_ident_pipeline, .tlv_ident_beh_hier_1")) || ($(e.target).is(".tlv_ident_pipeline, .tlv_ident_beh_hier_2"))) {
+                return this.highlightBehHier(le, e.ctrlKey);
+              } else {
+                return this.highlightLogicalElement(le, e.ctrlKey);
+              }
+            });
+            return $(`#${this.path} [data-navtlv-code]`).on("click", (e) => {
+              if ($(e.target).attr("logical_entity")) {
+                return;
+              }
+              return this.unhighlightLogicalElements();
+            });
+          };
+          /*
+          The Blade template doesn't immediately render, so using a timeout to ensure that the
+          file is in view.
+          TODO: Undo this.
+          */
+          setTimeout(bindClick, 150);
+          return this;
+        }
+
+        saveDOMState() {
+          var el;
+          el = Utils.$one(">[data-navtlv]>[data-navtlv-scroll]", this.paneEl);
+          return {
+            scrollTop: el.scrollTop(),
+            scrollLeft: el.scrollLeft()
+          };
+        }
+
+        restoreDOMState(state) {
+          var el;
+          el = Utils.$one(">[data-navtlv]>[data-navtlv-scroll]", this.paneEl);
+          el.scrollTop(state.scrollTop);
+          return el.scrollLeft(state.scrollLeft);
+        }
+
+        /*
+        Unhighlights all highlighted signals in NavTLV
+        @param {String} le the logical entity of the clicked on element
+        */
+        _unhighlightLogicalElements(le) {
+          $(`#${this.path} [data-navtlv-code] [logical_entity]`).removeClass("highlight");
+          return $(`#${this.path} [data-navtlv-code] .value-wrapper`).removeClass("highlight");
+        }
+
+        /*
+        Highlights all signals with the given logical entity in NavTLV
+        @param {String} le the logical entity to highlight
+        */
+        _highlightLogicalElement(le) {
+          $(`#${this.path} [data-navtlv-code] [logical_entity='${le}']`).addClass("highlight");
+          return $(`#${this.path} [data-navtlv-code] [logical_entity='${le}']`).each(function() {
+            return $(this).find(".value-wrapper").addClass("highlight");
+          });
+        }
+
+        /*
+        Sets compiler  to the given value.
+        @param {SandPiperCompiler} compiler The value to set as compiler
+        @return NavTLV
+        */
+        compiler(compiler) {
+          compiler.on("navTLV", this.navtlv);
+          compiler.on("navtlv/done", (data) => {
+            if (data.success === "success") {
+              return this.setStatus("success");
+            }
+            return this.setStatus(data.timeout ? "timeout" : "fail");
+          });
+          compiler.on("sandpiper/done", (data) => {
+            if (data.success !== "failure") {
+              return;
+            }
+            return this.setStatus(data.timeout ? "timeout" : "fail");
+          });
+          compiler.on("newcompile", () => {
+            this.setStatus("working");
+            return this.setWaveData(null);
+          });
+          compiler.on("vcd", (data) => {
+            return this.setWaveData(data.wd);
+          });
+          return this;
+        }
+
+        /*
+        Sets @_editor.
+        @param {Editor} _editor The value to set as editor
+        @return NavTLV
+        */
+        editor(_editor) {
+          this._editor = _editor;
+          return this;
+        }
+
+      };
+
+      // @property {Date} tracks the last change to the NavTLV
+      NavTLV._lastUpdated = null;
+
+      return NavTLV;
+
+    }).call(this);
+    Utils.extend(NavTLV, Pane.Steppable);
+    Utils.extend(NavTLV, Pane.Scalable);
+    Utils.extend(NavTLV, module.config(), true, true);
+    Utils.extend(NavTLV, ModelViewSync, {
+      _highlightLogicalElement: 1,
+      _unhighlightLogicalElements: 1
+    });
+    return NavTLV;
+  });
+
+}).call(this);

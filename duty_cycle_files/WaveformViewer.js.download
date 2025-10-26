@@ -1,0 +1,487 @@
+(function() {
+  var boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  define("WaveformViewer", function(require, exports, module) {
+    /*
+    class for managing and viewing the waveform representation of the given vcd file
+
+    @extend Pane
+    @extend ModelViewSync
+    */
+    var $, Logging, ModelViewSync, Pane, Promise, Utils, WaveData, WaveformGenerator, WaveformViewer;
+    $ = require("jquery");
+    Logging = require("Logging");
+    Utils = require("Utils");
+    ModelViewSync = require("ModelViewSync");
+    Pane = require("Pane");
+    Promise = require("bluebird");
+    WaveformGenerator = require("WaveformViewer/WaveformGenerator");
+    WaveData = require("VCD");
+    WaveformViewer = (function() {
+      var MAX_STARTING_SIGNALS, MAX_STARTING_TIME;
+
+      class WaveformViewer extends Pane {
+        constructor() {
+          super(...arguments);
+          //$(".timestamp", @getDOMElement()).livestamp()
+          this.onCycleUpdate = this.onCycleUpdate.bind(this);
+        }
+
+        /*
+        constructs a new WaveformViewer
+        @param {String} path becomes path property
+        @param {TabbedView} the corresponding TabbedView
+        @return {Promise} A promise resolving to this.
+        */
+        init(name, ide, project, tabbedview) {
+          return this.initPane("WaveformViewer", name, ide, project, tabbedview).then(() => {
+            var btn, btns, calculateCycle, camelCase, element, i, isDragging, keycode, len, startX, zoomNavigation;
+            this.enableTimestamp();
+            this.le = [];
+            element = this.getContainer();
+            this.project.on("cycle-update", this.onCycleUpdate);
+            isDragging = false;
+            startX = 0;
+            //Defined a variable to track navigation state.
+            this._zoomNavigationListening = false;
+            keycode = {
+              plus: 187, // '+' key
+              minus: 189, // '-' key
+              left: 37, // Left arrow key
+              right: 39, // Right arrow key
+              up: 38, // Up arrow key
+              down: 40 // Down arrow key
+            };
+            zoomNavigation = (e) => {
+              var ref, ref1, ref2, ref3, ref4, ref5;
+              if (!this._zoomNavigationListening) {
+                return;
+              }
+              // Don't intercept if any modifier keys are pressed
+              // This allows browser shortcuts like Ctrl+Plus/Ctrl+Minus to work normally
+              if (e.ctrlKey || e.metaKey) {
+                return;
+              }
+              if (e.keyCode === keycode.plus) {
+                e.preventDefault();
+                if ((ref = this.wg) != null) {
+                  ref.zoomIn();
+                }
+              }
+              if (e.keyCode === keycode.minus) {
+                e.preventDefault();
+                if ((ref1 = this.wg) != null) {
+                  ref1.zoomOut();
+                }
+              }
+              if (e.keyCode === keycode.left) {
+                e.preventDefault();
+                if ((ref2 = this.wg) != null) {
+                  ref2.moveLeft();
+                }
+              }
+              if (e.keyCode === keycode.right) {
+                e.preventDefault();
+                if ((ref3 = this.wg) != null) {
+                  ref3.moveRight();
+                }
+              }
+              if (e.keyCode === keycode.up) {
+                e.preventDefault();
+                if ((ref4 = this.wg) != null) {
+                  ref4.reachStart();
+                }
+              }
+              if (e.keyCode === keycode.down) {
+                e.preventDefault();
+                return (ref5 = this.wg) != null ? ref5.reachEnd() : void 0;
+              }
+            };
+            this.paneEl.on("mouseenter", (e) => {
+              if (this._zoomNavigationListening) {
+                return;
+              }
+              $(document).on("keydown", zoomNavigation);
+              return this._zoomNavigationListening = true;
+            });
+            this.paneEl.on("mouseleave", (e) => {
+              $(document).off("keydown", zoomNavigation);
+              return this._zoomNavigationListening = false;
+            });
+            this.paneEl.on("mousedown", "#vizBubble", function(e) {
+              isDragging = true;
+              startX = e.pageX;
+              return e.preventDefault();
+            });
+            calculateCycle = (pageX) => {
+              var cycle, parentOffset, relX;
+              parentOffset = this.getContainer().offset();
+              relX = pageX - parentOffset.left;
+              if (this.wg) {
+                cycle = Math.round((relX - this.wg.textRegionWidth) * this.wg.cyclesPerPixel + this.wg.currentStart);
+                return Math.max(this.wg.currentStart, Math.min(this.wg.currentEnd, cycle));
+              }
+              return null;
+            };
+            $(document).on("mousemove", (e) => {
+              var cycle;
+              if (isDragging && this.wg) {
+                cycle = calculateCycle(e.pageX);
+                if (cycle != null) {
+                  this.wg.setVizCursorCycle(cycle);
+                  return this.project.updateCycle(cycle);
+                }
+              }
+            });
+            $(document).on("mouseup", (e) => {
+              var finalCycle;
+              if (isDragging && this.wg) {
+                finalCycle = calculateCycle(e.pageX);
+                if (finalCycle != null) {
+                  this.project.updateCycle(finalCycle);
+                }
+              }
+              return isDragging = false;
+            });
+            // Moves the waveform cursor line when any of the waves is clicked
+            element.on("click", ".wave, .wavescope", (e) => {
+              var parentOffset, relX;
+              parentOffset = this.getContainer().offset();
+              relX = e.pageX - parentOffset.left;
+              return this.wg.setLineByPosition(relX);
+            });
+            // Highlights when name text (both `.name` and `.scope`), the value box, or the nameBackground are clicked
+            element.on("click", ".name, .value, .waveName, .scope", (e) => {
+              var le;
+              if ($(e.target).is(".waveExpand, .waveCollapse")) {
+                return;
+              }
+              this.le.push(le = $(e.target).parent().attr("logical_entity").replace(/\[[0-9]+\]/g, ""));
+              if ($(e.target).parent().find(".scope").length) {
+                return this.highlightBehHier(le, e.ctrlKey);
+              } else {
+                return this.highlightLogicalElement(le, e.ctrlKey);
+              }
+            });
+            // moves global cycle vertical cursor when ruler is clicked
+            element.on("click", ".ruler", (e) => {
+              var cycle, parentOffset, relX;
+              parentOffset = this.getContainer().offset();
+              relX = e.pageX - parentOffset.left;
+              if (relX > this.wg.textRegionWidth) {
+                cycle = Math.round((relX - this.wg.textRegionWidth) * this.wg.cyclesPerPixel + this.wg.currentStart);
+                cycle = Math.max(this.wg.currentStart, Math.min(this.wg.currentEnd, cycle)); // Clamp cycle
+                return this.project.updateCycle(cycle);
+              }
+            });
+            element.on("wheel", (e) => {
+              var container, cursorCycle, delta, isOverRuler, parentOffset, relX, zoomScale;
+              if (!this.wg) {
+                return;
+              }
+              // Return unless shift key is pressed.
+              isOverRuler = $(e.target).hasClass('ruler') || $(e.target).parents('.ruler').length > 0;
+              if (!(e.shiftKey || isOverRuler)) {
+                return;
+              }
+              container = this.getContainer();
+              if (!(container.is(e.target) || container.has(e.target).length)) {
+                return;
+              }
+              // Calculate the cycle under the cursor
+              parentOffset = this.getContainer().offset();
+              relX = e.pageX - parentOffset.left;
+              cursorCycle = null;
+              if (relX > this.wg.textRegionWidth) {
+                cursorCycle = Math.round((relX - this.wg.textRegionWidth) * this.wg.cyclesPerPixel + this.wg.currentStart);
+                cursorCycle = Math.max(this.wg.currentStart, Math.min(this.wg.currentEnd, cursorCycle));
+              }
+              
+              // Calculate zoom parameters
+              delta = e.originalEvent.deltaY || e.originalEvent.wheelDelta || -e.originalEvent.detail;
+              e.preventDefault();
+              zoomScale = 1 + Math.abs(delta) / 200;
+              zoomScale = Math.min(Math.max(zoomScale, 1.05), 2);
+              
+              // Apply zoom with cursor position if available, otherwise center zoom
+              if (delta > 0) {
+                if (cursorCycle != null) {
+                  return this.wg.zoomOut(zoomScale, cursorCycle);
+                } else {
+                  return this.wg.zoomOut(zoomScale);
+                }
+              } else {
+                if (cursorCycle != null) {
+                  return this.wg.zoomIn(zoomScale, cursorCycle);
+                } else {
+                  return this.wg.zoomIn(zoomScale);
+                }
+              }
+            });
+            // Binds to the different buttons
+            btns = ["zoom-in", "zoom-out", "zoom-full", "move-left", "move-right"];
+            camelCase = function(str) {
+              return str.replace(/-([a-zA-Z])/g, function(g) {
+                return g[1].toUpperCase();
+              });
+            };
+            for (i = 0, len = btns.length; i < len; i++) {
+              btn = btns[i];
+              ((btn) => {
+                var header;
+                header = Utils.$one("#mc-waveform-header", this.paneEl);
+                return header.on("click", `[data-waveformviewer-button-${btn}]`, (e) => {
+                  if (this.wg) {
+                    return this.wg[camelCase(btn)]();
+                  }
+                });
+              })(btn);
+            }
+            //collapse scope
+            element.on("click", ".waveCollapse", (e) => {
+              this.wg.collapseScope($(e.target).parent().attr("logical_instance"));
+              return this.wg.generateWave(this.wg.currentStart, this.wg.currentEnd);
+            });
+            //expand scope
+            element.on("click", ".waveExpand", (e) => {
+              this.wg.expandScope($(e.target).parent().attr("logical_instance"));
+              return this.wg.generateWave(this.wg.currentStart, this.wg.currentEnd);
+            });
+            return this;
+          });
+        }
+
+        saveDOMState() {
+          var el;
+          el = $(`#${this.path}-waveform-body-wrapper`);
+          if (el.length === 0) {
+            return {};
+          } else {
+            return {
+              scrollTop: el.scrollTop(),
+              scrollLeft: el.scrollLeft() // (There can only be a horizontal scrollbar because of a bug.)
+            };
+          }
+        }
+
+        restoreDOMState(state) {
+          var el;
+          el = $(`#${this.path}-waveform-body-wrapper`);
+          if (el.length === 1) {
+            if (state.scrollTop != null) {
+              el.scrollTop(state.scrollTop);
+            }
+            if (state.scrollLeft != null) {
+              return el.scrollLeft(state.scrollLeft);
+            }
+          }
+        }
+
+        /*
+        @return the waveform container element.
+        */
+        getContainer() {
+          return Utils.$one("[data-WaveformViewer-container]", this.paneEl);
+        }
+
+        /*
+        @return the path of this waveform viewer.
+        */
+        getPath() {
+          return this.path;
+        }
+
+        /*
+        Resize callback.
+        @param {Boolean} force if `false` only redraw if size changed
+        */
+        resize(force = false) {
+          var state, width;
+          width = this.getContainer().width();
+          if (this.wg && (force || (width !== this.wg.windowWidth))) {
+            state = this.saveDOMState();
+            this.wg.generateWave(this.wg.currentStart, this.wg.currentEnd, width);
+            return this.restoreDOMState(state);
+          }
+        }
+
+        /*
+        Initialization to provide a compiler
+        @param {compiler} _compiler the compiler in use
+        */
+        compiler(_compiler) {
+          this._compiler = _compiler;
+          this._compiler.on("vcd", (data) => {
+            var locked, wd;
+            ({locked, wd} = data);
+            if (!locked) {
+              Utils.assert(this.simulationEnabled, "'vcd' event received by WaveformViewer while simulation is disabled. (This should be filtered by ServerCompiler.)");
+              this.setStatus("success");
+            }
+            return this.updateWaveData(wd);
+          });
+          this._compiler.on("sandpiper/done", (data) => {
+            if (data.success === "success" || !this.simulationEnabled) {
+              return;
+            }
+            return this.setStatus(data.timeout ? "timeout" : "fail");
+          });
+          this._compiler.on("verilator/done", (data) => {
+            if (this.simulationEnabled) {
+              return this.setStatus(data.success === "success" ? "success" : data.timeout ? "timeout" : "fail");
+            } else {
+              // Waveform currently locked. Ignore the new VCD data.
+              console.log("Info: Simulation data received while waveforms are locked.");
+            }
+          });
+          this._compiler.on("newcompile", () => {
+            if (this.simulationEnabled) {
+              return this.setStatus("working");
+            }
+          });
+          // Maintain @simulationEnabled
+          return this.project.on("simulation-enabled", (enabled) => {
+            if (this.simulationEnabled !== enabled) {
+              this.simulationEnabled = enabled;
+              if (enabled) {
+                return this.setStatus("fail"); // Waveform invalid until next simulation data arrives.
+              } else {
+                return this.setStatus("locked");
+              }
+            }
+          });
+        }
+
+        /*
+        Sets the HTML of this viewer.
+        @param {String} out the string representation of the HTML to display
+        */
+        toHTML(out) {
+          var date, ref, state;
+          state = this.saveDOMState();
+          // generate html in DOM
+          this.getContainer().html(out);
+          this.restoreDOMState(state);
+          this.rendered = true;
+          // Position cursors
+          if ((this.wg.lineCycle != null) && !isNaN(this.wg.lineCycle)) {
+            this.wg.setLineByCycle(this.wg.lineCycle);
+          }
+          if (((ref = this.project) != null ? ref.cyc : void 0) != null) {
+            this.wg.setVizCursorCycle(this.project.cyc);
+          }
+          if ((this.le != null) && this.le.length > 0) {
+            // Highlight elements
+            this._highlightLogicalElement(this.le);
+          }
+          return date = new Date();
+        }
+
+        onCycleUpdate(cyc) {
+          boundMethodCheck(this, WaveformViewer);
+          Utils.assert((cyc != null) && !isNaN(cyc), `Invalid cycle value: ${cyc}`);
+          if (this.wg != null) {
+            return this.wg.setVizCursorCycle(cyc);
+          }
+        }
+
+        /*
+        Updates the viewer based on the wave data passed to it
+        @param {WaveData} wd the waveform data
+        */
+        updateWaveData(wd) {
+          this.wg = new WaveformGenerator(this, wd, this.getPath()); // TODO: Pass path or element?
+          if (wd.numTlvSignals > MAX_STARTING_SIGNALS) {
+            this.wg.collapseAllScopes();
+          } else {
+            this.wg.collapseScope("SV");
+          }
+          if (wd.lastCycle > MAX_STARTING_TIME) {
+            this.wg.currentEnd = MAX_STARTING_TIME;
+          }
+          this.wg.lineCycle = 0;
+          if (this.active) {
+            return this.resize();
+          }
+        }
+
+        /*
+        Highlight waveform elements based on the given logical entity
+        @param {String} le the given logical entity
+        */
+        _highlightLogicalElement(le) {
+          var ele, i, len, results;
+          if (!(le instanceof Array)) {
+            this.le.push(le);
+            le = this.le;
+          }
+          results = [];
+          for (i = 0, len = le.length; i < len; i++) {
+            ele = le[i];
+            results.push($(`#${this.getPath()} [logical_entity='` + ele + "']").find(".name, .waveName, .wave rect, .value").addClass("highlight"));
+          }
+          return results;
+        }
+
+        /*
+        Highlights waveform elements belonging to the given behavioral hierarchy logical entity
+        @param {String} le the logical entity representing the pipeline
+        */
+        _highlightBehHier(le) {
+          return $(`#${this.getPath()} [logical_entity*='` + le + "']").find(".name, .waveName, .wave rect, .value").addClass("highlight");
+        }
+
+        // console.log ("##{@getPath()} [logical_entity*='" + le + "']")
+        /*
+        Unhighlights all waveform elements
+        */
+        _unhighlightLogicalElements() {
+          $(`#${this.getPath()} .highlight`).removeClass("highlight");
+          return this.le = [];
+        }
+
+      };
+
+      // @property {String} the web path where files in <module>/public/ are hosted
+      WaveformViewer.prototype.public = null;
+
+      // @property {Boolean} Whether simulation is enabled. Set by events from {ProjectManager}.
+      WaveformViewer.prototype.simulationEnabled = true;
+
+      // @property {WaveformGenerator} the waveform generator used by this viewer
+      WaveformViewer.prototype.wg = null;
+
+      // @property {Boolean} true if the HTML for the waveform has been inserted into the DOM.
+      WaveformViewer.prototype.rendered = false;
+
+      // @property {ServerCompile} a wrapper around the compilation
+      WaveformViewer.prototype._compiler = null;
+
+      // @property {TabbedView} the tabbedview this element belongs to
+      WaveformViewer.prototype._tabbedview = null;
+
+      // @property {Array<String>} represents the logical entities that should be currently highlighted
+      WaveformViewer.prototype.le = null;
+
+      // @property {Boolean} `true` if the timestamp should be hidden
+      WaveformViewer.prototype.hidden = null;
+
+      // @property {Number} MAX_STARTING_SIGNALS constant for determining when to start with all scopes collapsed
+      MAX_STARTING_SIGNALS = 50;
+
+      // @property {Number} MAX_STARTING_TIME constant for determining when to limit the original view time width
+      MAX_STARTING_TIME = 100;
+
+      return WaveformViewer;
+
+    }).call(this);
+    Utils.extend(WaveformViewer, module.config(), true, true);
+    Utils.extend(WaveformViewer, ModelViewSync, {
+      _highlightLogicalElement: 1,
+      _unhighlightLogicalElements: 1,
+      _highlightBehHier: 1
+    });
+    return WaveformViewer;
+  });
+
+}).call(this);

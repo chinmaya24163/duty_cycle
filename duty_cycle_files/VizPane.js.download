@@ -1,0 +1,3348 @@
+(function() {
+  var indexOf = [].indexOf;
+
+  define("VizPane", function(require, exports, module) {
+    /*
+    A \viz* section of TL-Verilog code.
+    */
+    /*
+    Legacy classes for \viz_alpha
+    */
+    /*
+    Encapsulated context for viz_alpha function invocation. A new one of these is created for each invocation.
+    We could just use VizElement, but this hides functions not intended for the user.
+    */
+    /*
+    A \viz* section of TL-Verilog code.
+    */
+    /*
+    An element in a visual hierarchy, which could be either a VizInstanceElement or a VizScopeElement.
+    The hierarchy is created once per compilation. These are per instance for replicated scopes.
+    Every \viz_js block (or level in the TLV parse hierarchy with a descendant containing a \viz_js block)
+    has VizInstanceElement(s), and for replicated parse scopes, a VizScopeElement above it.
+    Replicated parse scopes (in this context) are those with a range or with a \viz_js block with an
+    'all' property.
+
+    TODO: Disallow 'all' in non-replicated scopes.
+          See comment on VizElement index property and index constructor arg.
+          And, look for checks for .all.
+
+    Each VizElement has an associate Fabric.Group. Note that Fabric.js makes some unfortunate choices about
+    the way the Group coordinate system is maintained. It maintains the coordinate system to have (0,0) in the
+    center of the Group. We wish the user to define (0,0) and for it to remain consistent, so the user can directly modify
+    'left'/'top' properties or add new Objects using the coordinate system they define. Thus, we never
+    addWithUpdate(..), and we jump through hoops to work with the user-defined coordinate system, where
+    Fabric assumes adjusted coordinates.
+
+    Since there can be many instances of this class, we are (or should be) stingy about its memory footprint.
+    */
+    /*
+    These two classes, VIZInstanceContext and VizScopeContext form an alternating hierarchy that defines the instantiated design
+    hierarchy of visual elements.
+    */
+    /*
+    An instance of a scope in the viz_alpha instance hierarchy.
+    */
+    /*
+    Encapsulated context for viz_js function invocation. A new one of these is created for each instance along with the VizElement.
+    We could just use VizElement, but this hides functions not intended for the user.
+    TODO: Yeah, let's combine these.
+    */
+    /*
+    A module that visualizes simulation from TLV \viz* nodes.
+    See User Guide: https://docs.google.com/document/d/1GycZj6urGJ4gw0mdkXh0x3vTnFwVDR--_7rA4PR2rzc/edit?usp=sharing.
+
+    @extend Pane
+    @extend ModuleConfigObject
+    @extend ModelViewSync
+    */
+    /*
+    A scope in the viz_alpha instance hierarchy.
+    TODO: There's a lot of commonality with VizInstanceContext, so there should be a superclass.
+    */
+    var $, Logging, LogicalInstance, LogicalScope, ModelViewSync, NonExistentSignalError, Pane, ParseScope, Promise, ScrollWrapper, SignalValue, SignalValueSet, Utils, VizAlphaBlock, VizAlphaContext, VizBlock, VizElement, VizInstanceContext, VizInstanceElement, VizJSContext, VizPane, VizScopeContext, VizScopeElement, nxCompiler;
+    ModelViewSync = require("ModelViewSync");
+    Pane = require("Pane");
+    SignalValue = require("VCD/SignalValue");
+    NonExistentSignalError = SignalValue.NonExistentSignalError;
+    SignalValueSet = require("VCD/SignalValueSet");
+    $ = require("jquery");
+    Logging = require("Logging");
+    Utils = require("Utils");
+    Promise = require("bluebird");
+    nxCompiler = require("@nx-js/compiler-util-hack");
+    ScrollWrapper = require("ScrollWrapper");
+    window.fabric = require("fabric");
+    VizPane = (function() {
+      class VizPane extends Pane {
+        constructor() {
+          super();
+          this.model = null;
+          this.parseModel = null;
+          this.cyc = 0;
+          this.hackFabric();
+        }
+
+        // Hack Fabric.
+        hackFabric() {
+          var origAnimate, thisPane;
+          // TODO: Work out optimal caching.
+          fabric.Object.prototype.objectCaching = false;
+          // Fabric removed these for no good reason. Adding them back with a warning for a graceful transition to newer Fabric version.
+          fabric.Object.prototype.setText = function(text) {
+            console.log("Warning: setText(...) is deprecated. Use set({text: ...}) instead.");
+            return this.set({text});
+          };
+          fabric.Object.prototype.setFill = function(fill) {
+            console.log("Warning: setFill(...) is deprecated. Use set({fill: ...}) instead.");
+            return this.set({fill});
+          };
+          fabric.Object.prototype.setStroke = function(stroke) {
+            console.log("Warning: setStroke(...) is deprecated. Use set({stroke: ...}) instead.");
+            return this.set({stroke});
+          };
+          fabric.Object.prototype.setStrokeWidth = function(strokeWidth) {
+            console.log("Warning: setStrokeWidth(...) is deprecated. Use set({strokeWidth: ...}) instead.");
+            return this.set({strokeWidth});
+          };
+          fabric.Object.prototype.setVisible = function(visible) {
+            console.log("Warning: setVisible(...) is deprecated. Use set({visible: ...}) instead.");
+            return this.set({visible});
+          };
+          fabric.Object.prototype.setOpacity = function(opacity) {
+            console.log("Warning: setOpacity(...) is deprecated. Use set({opacity: ...}) instead.");
+            return this.set({opacity});
+          };
+          // Hack Object to:
+          //   - support Promise-based animation
+          //   - support thenAnimate(...), thenSet(...), and thenWait(delay) for easier-than-Promise animation
+          //   - automate rerendering
+          //   - avoid animation after cycle change
+          //   - scale time
+
+          // Best I can tell, Fabric is pretty brain-dead about rendering. requestRenderAll() causes glitches.
+          // We'll record the need to render and do it in a global timeout.
+
+          // Get the most recent Promise, to be accessed synchronously after [then]animate/set/wait(..) to then
+          // establish chaining.
+          thisPane = this;
+          fabric.Object.prototype.getPromise = function() {
+            if (!this.__promise) {
+              this.__promise = Promise.resolve(void 0);
+            }
+            return this.__promise;
+          };
+          // Add thenable behavior to Object for use (explicitly or as `await`) after [then]animate/set/wait(..).
+          // Apply then to the Promise, but throw an error if the cycle has changed.
+          fabric.Object.prototype.then = function(onFulfilled, onRejected) {
+            var renderCyc;
+            renderCyc = thisPane._renderCnt;
+            this.__promise = this.getPromise().then(function(data) {
+              if (thisPane._renderCnt === renderCyc) {
+                // All good. Normal onFulfill behavior.
+                if (typeof onFulfilled === "function") {
+                  return onFulfilled(data);
+                } else {
+                  return data;
+                }
+              } else {
+                return void 0;
+              }
+            }, onRejected);
+            return this;
+          };
+          fabric.Object.prototype.catch = function(onRejected) {
+            return this.then(null, onRejected);
+          };
+          fabric.Object.prototype.finally = function(onFinally) {
+            return this.getPromise().finally(onFinally);
+          };
+          // Modify Object.animate to automate rendering, avoid animation after a cycle change, and scale time.
+          origAnimate = fabric.Object.prototype.animate;
+          fabric.Object.prototype.animate = function() {
+            var args, origAbort, origOnComplete, props, ref, ref1, ref2, renderCyc;
+            // There are two forms of animate arguments. The legacy form takes a single property as a string and a value.
+            // Convert this to the new form.
+            props = {};
+            args = {};
+            if (typeof arguments[0] === "string") {
+              // Legacy form: animate(propName, toValue, options)
+              props[arguments[0]] = arguments[1];
+              args = (ref = arguments[2]) != null ? ref : {};
+            } else {
+              // New form: animate(props, options)
+              props = (ref1 = arguments[0]) != null ? ref1 : {};
+              args = (ref2 = arguments[1]) != null ? ref2 : {};
+            }
+            
+            // Default duration of 500ms (as defined by fabric).
+            if (typeof (args != null ? args.duration : void 0) !== "number") {
+              args.duration = 500;
+            }
+            
+            // Scale time.
+            args.duration = args.duration * thisPane.scrollWrapper.timestep;
+            // Wrap animation in a Promise, resolved by onComplete.
+            // Abort on cycle change.
+            origOnComplete = args.onComplete;
+            origAbort = args.abort;
+            renderCyc = thisPane._renderCnt;
+            this.__promise = new Promise((resolve, reject) => {
+              // Resolve on onComplete.
+              args.onComplete = () => {
+                if (typeof origOnComplete === "function") {
+                  // Call the original onComplete function.
+                  origOnComplete.apply(this, arguments);
+                }
+                // Even though we ensure a render after the animation duration, the property updates for
+                // animation are done separately, and may lag behind the animation. They have been updated
+                // at this point, so force one last render.
+                thisPane._renderNeeded(false);
+                // Resolve Promise.
+                return resolve(void 0);
+              };
+              // Abort if the cycle changes.
+              // Note that we apply a hack to fabric.js to change the abort behavior.
+              // In fabric, abort sets the animated value to its final value. But this happens asynchronously, so it can
+              // interfere with a new animation. We remove this final update from fabric after downloading it.
+              return args.abort = () => {
+                // If the cycle has changed, abort the animation.
+                return (thisPane._renderCnt !== renderCyc) || (typeof origAbort === "function" ? origAbort.apply(this) : false);
+              };
+            });
+            // Ensure rendering.
+            thisPane._animateForAtLeast(args.duration, false);
+            return origAnimate.call(this, props, args);
+          };
+          // Add a wait function to Object.
+          fabric.Object.prototype.wait = function(delay) {
+            this.__promise = new Promise(function(resolve, reject) {
+              // Set a timeout.
+              return setTimeout(function() {
+                return resolve(void 0);
+              }, delay * thisPane.scrollWrapper.timestep);
+            });
+            return this;
+          };
+          
+          // Chained functions.
+          fabric.Object.prototype.thenAnimate = function() {
+            var rc;
+            // Chain the animation to the Object's Promise.
+            // Animate only if the render count hasn't changed.
+            rc = thisPane._renderCnt;
+            this.__promise = this.getPromise().then(() => {
+              // If the render count has changed, we don't need to animate.
+              if (thisPane._renderCnt === rc) {
+                return this.animate.apply(this, arguments);
+              }
+              return void 0; // Return undefined to avoid Promise chaining.
+            });
+            return this;
+          };
+          fabric.Object.prototype.thenSet = function() {
+            var rc;
+            // Chain the set to the Object's Promise.
+            // Set only if the render count hasn't changed.
+            rc = thisPane._renderCnt;
+            this.__promise = this.getPromise().then(() => {
+              // If the render count has changed, we don't need to set.
+              if (thisPane._renderCnt === rc) {
+                this.set.apply(this, arguments);
+                thisPane._renderNeeded(true);
+              }
+              return void 0; // Return undefined to avoid Promise chaining.
+            });
+            return this;
+          };
+          return fabric.Object.prototype.thenWait = function() {
+            var rc;
+            // Chain a wait to the Object's Promise.
+            // Wait only if the render count hasn't changed (otherwise the next in the chain could miss a change).
+            rc = thisPane._renderCnt;
+            this.__promise = this.getPromise().then(() => {
+              // If the render count has changed, we don't need to wait.
+              if (thisPane._renderCnt === rc) {
+                return this.wait.apply(this, arguments);
+              }
+              return void 0; // Return undefined to avoid Promise chaining.
+            });
+            return this;
+          };
+        }
+
+        
+          // Animate for at least the given duration from now.
+        // @param {int} duration The duration in milliseconds.
+        // @param {boolean} immediate Whether to render immediately vs. after a delay.
+        _animateForAtLeast(duration, immediate) {
+          var atLeastTime;
+          // Schedule the next render (which will trigger more).
+          this._renderNeeded(immediate);
+          // Set the max time for the animation to be the end of the animation.
+          // We do this after setting the timeout to ensure that the last timeout occurs after animation is complete.
+          if (duration > 0) {
+            atLeastTime = Date.now() + duration;
+            //console.log("Animating for at least #{duration}ms. Beyond current max time by #{atLeastTime - @maxAnimateTime}ms.")
+            if (this.maxAnimateTime < atLeastTime) {
+              return this.maxAnimateTime = atLeastTime;
+            }
+          }
+        }
+
+        // Call when an object property changes or will change, requiring rerendering.
+        // @param {boolean} immediately Whether to render immediately or after a delay.
+        _renderNeeded(immediately) {
+          var rc;
+          // If we need to upgrade the current timeout to be immediate, cancel it.
+          if (!this.immediateAnimate && immediately) {
+            clearTimeout(this.animateInterval);
+            this.animateInterval = null;
+          }
+          // If not already scheduled, schedule the next render.
+          if (this.animateInterval === null) {
+            // Schedule a render.
+            rc = this._renderCnt;
+            this.animateInterval = setTimeout(() => {
+              var needRender;
+              // There is no longer a pending render.
+              this.animateInterval = null;
+              if (this._renderCnt === rc) {
+                // Still rendering this cycle.
+
+                // Determine whether more rendering is needed.
+                // This is done before rendering to be sure we're rendering the final state.
+                needRender = Date.now() < this.maxAnimateTime;
+                
+                // Render.
+                this.vizGlobal.canvas.renderAll();
+                // Schedule the next render. Do this after rendering to exclude render time from the
+                // render delay (to leave time for other processing).
+                if (needRender) {
+                  return this._renderNeeded(false);
+                }
+              } else {
+                return console.log("Bug: Rendering for the wrong cycle.");
+              }
+            }, immediately ? 0 : 30);
+            return this.immediateAnimate = immediately;
+          }
+        }
+
+        init(name, ide, project, tabbedview) {
+          return this.initPane("VizPane", name, ide, project, tabbedview, {
+            alwaysLive: true
+          }, true).then(() => {
+            var el;
+            this.enableTimestamp();
+            //@steppableInit()
+            // @steppableInitDOM()
+            // Init DOM.
+            el = Utils.$one('<canvas id="canvas"' + ' data-Viz-canvas="data-Viz-canvas"></canvas>');
+            this.contentContainerEl[0].appendChild(el[0]);
+            return this;
+          });
+        }
+
+        resize() {
+          super.resize();
+          // Resize canvas.
+          if (this.content !== null) {
+            return this.content.resize(this.contentContainerEl.width(), this.contentContainerEl.height());
+          }
+        }
+
+        /*
+        Process new parse model emitted by {CompileServer}.
+        @param {Object, null, undefined} model The parse model;
+                                               null for simulation with no parse model (e.g. --sphelp);
+                                               undefined to prepare the same model for new waveData
+        */
+        onViz(model) {
+          var defaultModel, prevFocus, prevScale, w;
+          // Create top-level @logicalModel.
+          this.logicalModel = new LogicalScope(this);
+          // Top level is not explicit in file. Make /top a proper level.
+          if (model == null) {
+            model = [];
+          }
+          defaultModel = {
+            type: "BEH_HIER",
+            ident: "/top",
+            children: model
+          };
+          model = defaultModel;
+          //@unrender()
+          this.renderedCyc = null; // Mark as unrendered without actually unrender()ing, since we're going to destroy it.
+          this.lastRenderCyc = null;
+          // Destroy old @content.
+          if (this.content !== null) {
+            prevScale = this.content.contentScale;
+            prevFocus = this.content.userFocus;
+            this.content.destroy();
+            this.content = null;
+            this.content = new VizPane.ScalableFabric(this, prevScale, prevFocus);
+          } else {
+            this.content = new VizPane.ScalableFabric(this); // TODO: Create based on top-level \viz_alpha content.
+          }
+          this.vizGlobal = {
+            canvas: this.content.canvas,
+            Grid: VizPane.Grid
+          };
+          this.logicalInstances = {};
+          this.model = this.prepModel(model, this.logicalModel);
+          if (!(this.model.hasVizJS || this.model.hasVizAlpha) && this.model.viz_js === null) {
+            // Apply default visualization.
+            this.model.viz_js = new VizBlock(this, this.defaultVizSrc, false, null, false);
+            this.model.hasVizJS = true;
+          }
+          if (!this.model.hasVizJS) {
+            // \viz_alpha-only. Provide a default top-level VizBlock.
+            this.model.viz_js = new VizBlock(this, "", false, null, false);
+          }
+          this.oldTopInstance = new VizScopeContext(null, "top", this.model, this, []);
+          // Provide defaults for top-level where. Canvas resets to scale of 1. (This is different from DIAGRAM which scales to fit.)
+          // TODO: How should this work for multiple /top\viz_js blocks? I'm not sure this code even does anything.
+          w = this.model.viz_js.viz.where;
+          if (w.width == null) {
+            w.width = 600;
+          }
+          if (w.height == null) {
+            w.height = 600;
+          }
+          if (w.left == null) {
+            w.left = -w.width / 2;
+          }
+          if (w.top == null) {
+            w.top = -w.height / 2;
+          }
+          w.justifyX = "center";
+          w.justifyY = "center";
+          if (w.visible == null) {
+            w.visible = false;
+          }
+          // TODO: What about multiple top-level \viz_js blocks?
+          this.topInstance = new VizInstanceElement(null, 0, this.model, this, []);
+          // Add @topInstance to canvas (and its whereBox).
+          if (this.topInstance.whereBox.visible) {
+            this.vizGlobal.canvas.add(this.topInstance.whereBox);
+          }
+          this.vizGlobal.canvas.add(this.topInstance.group);
+          return this.resize();
+        }
+
+        /*
+        Register the compiler.
+        @param {ServerCompile} compiler The value to set as compiler
+        @return Graph
+        */
+        setCompiler(compiler) {
+          this.compiler = compiler;
+          compiler.on("newcompile", (data) => {
+            this.lastCompileID = data.id;
+            this.lastCompileSim = (data.sim == null) || data.sim;
+            this.model = null;
+            return this.setStatus("working");
+          });
+          compiler.on("vcd", (data) => {
+            var locked;
+            locked = data.locked;
+            this.readyWaveData = data.wd;
+            if (locked) {
+              if (this.model != null) {
+                // A new VCD has been opened (and locked). Apply it to current parse model (VIZ) if any.
+                // There shouldn't be a "verilator/done" event (which would be synchronous to this).
+                this.onViz(void 0); // Reset VIZ.
+                return this.gotCompileResults("vcd", "loaded"); // Note that projects loaded from server with VCDs will get here with @model == null, then compile.
+              }
+            } else {
+              // We'll get "verilator/done" event (synchronous and subsequent to this).
+              return Utils.assert(this.simulationEnabled, "'vcd' event received by VizPane while simulation is disabled. (This should be filtered by ServerCompiler.)");
+            }
+          });
+          compiler.on("simulation-enabled", (enabled) => {
+            return this.simulationEnabled = enabled;
+          });
+          compiler.on("verilator/done", (data) => {
+            if (this.simulationEnabled) {
+              // Note that this is synchronous with "vcd" event.
+              if (data.success === "success") {
+                Utils.assert(data.id === this.lastCompileID);
+                return this.gotCompileResults("vcd", data.id);
+              } else {
+                return this.setStatus(data.timeout ? "timeout" : "fail");
+              }
+            } else {
+              return console.log("Info: Verilator completed while simulation is disabled.");
+            }
+          });
+          // We do not trigger VIZ refresh here. "parse model/done" could have happeded before or after the VCD
+          // was locked. Whichever happened last would trigger the refresh.
+          compiler.on("parse model", ({model, id}) => {
+            // TODO: This check is for --help which doesn't produce any parse model. This is not the best
+            //       way to handle this case. Would be better to recognize that no model was produced and
+            //       not emit the event.
+            // model == undefined to reuse the same model for new waveData.
+            if (model !== null) {
+              return this.onViz(model);
+            }
+          });
+          compiler.on("sandpiper/done", (data) => {
+            if (data.success === "success") {
+              return;
+            }
+            return this.setStatus(data.timeout ? "timeout" : "fail");
+          });
+          return compiler.on("parse model/done", ({success, id, timeout}) => {
+            var comp, sim;
+            // TODO: If simulation was disabled for this compilation, we need to know that we're not getting a VCD to trigger gotCompileResults.
+            comp = this.compiler.compilations[id];
+            sim = comp ? comp.sim : false;
+            if (success === "success") {
+              return this.gotCompileResults("parse model", id, sim);
+            } else {
+              return this.setStatus(timeout ? "timeout" : "fail");
+            }
+          });
+        }
+
+        // "verilator/done" and "parse model/done" must both be complete to generate viz.
+        // We also generate VIZ if the VCD is locked.
+        // This is called on "verilator/done" and "parse model/done" as well as by "vcd" with {locked: true}.
+        // Should have already received "parse model" and initialized VIZ.
+        // @param {String} which "vcd" or "parse model"
+        // @param {int} id the compilation ID; @vcdCompileID or @parseModelCompileID are set to this
+        // @param {Boolean} sim whether the compilation included simulation (for "parse model" only)
+        gotCompileResults(which, id, sim = true) {
+          if (which === "vcd") {
+            this.vcdCompileID = id;
+          } else {
+            this.parseModelCompileID = id;
+          }
+          Utils.assert(which === "vcd" || which === "parse model");
+          if (this.vcdCompileID === this.parseModelCompileID || !this.simulationEnabled || !sim) {
+            // Use new wave data.
+            Utils.assert(this.readyWaveData !== null);
+            this.setWaveData(this.readyWaveData);
+            if (this.model !== null) {
+              this.setStatus("success");
+              // VIZ has been initialize and generally not rendered. If, however, the waveform has been locked and unlocked during compilation,
+              // this will render, and we will need to re-initialize.
+              if (this.renderedCyc !== null) {
+                console.log("Received waveform data while VIZ was rendered. This is a bit pathological. Was the waveform locked and unlocked during compilation?");
+                this.onViz(void 0);
+              }
+              // Recursively call \viz_js onTraceData() functions
+              this.topInstance.onTraceData([]);
+              // Render all.
+              this.render();
+            } else {
+              if (this.simulationEnabled) {
+                this.setStatus("fail");
+              }
+            }
+          }
+          return this;
+        }
+
+        initOpened() {}
+
+        //- @vizGlobal = {canvas: new fabric.Canvas('canvas')}
+        /*
+        Recurse into parse model (as given in .viz file, and described below), creating @parseModel and @logicalModel.
+
+        SandPiper returns a "parse model" as:
+        [{   // Children of /top.
+          type: <string>,  // One of "BEH_HIER", "PIPELINE", "VIZ_JS", "VIZ_ALPHA"
+          ident: <string>,  // (for scopes) E.g. "/top", "|my_pipe"
+          min_index: <int/string>,  // (for behavioral scopes with range) right index as integer (required for VIZ) or expression string.
+          max_index: <int>,  // (for behavioral scopes with range) left index as integer (required for VIZ) or expression string.
+          src: <multiline string>,  // (for "VIZ" type) content of the \viz_js block.
+          children: [   // (for scopes) recurse
+            {type: ..., etc.}, {...}  // children objects, having same structure
+          ],
+        }, ...]
+
+        TODO:
+        Currently, each parse scope can have at most one \viz_js block, and the VIZ hierarchy matches the parse model.
+        The plan is:
+          - Allow multiple \viz_js blocks in a single parse scope.
+          - A \viz_js can have multiple where's. Each has a default parent based on the parse hierarchy but may specify a different one
+            as a logical scope and/or \viz_js name.
+          - Each \viz_js may specify a name for each where. The name is accessible to customize each instance.
+        TODO:
+        Currently, '/scope' returns `{lib, data}`, where `lib` is the shallow merge of `lib`s of corresponding \viz_js blocks.
+        Lib functions cannot reference signals.
+        The plan is:
+          - '/scope' references return {lib, getInstance()}
+            - lib: TODO: This requires binding to a `sigRef` that accesses `getInstance()` (below).
+
+        @param {Object} model the sub parse model
+        @param {LogicalScope} logicalScope The logical scope corresponding to this sub parse model.
+        @return {ParseScope, null} the created `ParseScope` or null if the scope is unneeded
+        */
+        prepModel(model, logicalScope) {
+          var child, childHasVizAlpha, childHasVizJS, children, hasVizAlpha, hasVizJS, has_range, j, len, logicalChild, obj, ref, ret, viz_alpha, viz_js;
+          ret = null;
+          hasVizJS = false;
+          hasVizAlpha = false;
+          childHasVizJS = false;
+          childHasVizAlpha = false;
+          viz_js = null;
+          viz_alpha = null;
+          has_range = model.min_index != null;
+          if (has_range !== (model.max_index != null) && model.min_index !== "*") {
+            Utility.assert(false, "Malformed scope range properties in VIZ file.");
+            // Treat this as non-ranged.
+            delete model.min_index;
+            delete model.max_index;
+            has_range = false;
+          }
+          // Construct children first to know whether they are needed.
+          children = [];
+          ref = model.children;
+          for (j = 0, len = ref.length; j < len; j++) {
+            obj = ref[j];
+            if (obj.type === "VIZ_ALPHA") {
+              hasVizAlpha = true;
+              viz_alpha = new VizAlphaBlock(this, obj.src);
+            // (optional) delete obj.src  # No longer needed.
+            } else if (obj.type === "VIZ_JS") {
+              hasVizJS = true;
+              if (viz_js) {
+                console.log(`Warning: Multiple \\viz_js blocks for scope ${model.ident}. Ignoring one.`);
+              }
+              viz_js = new VizBlock(this, obj.src, true, has_range, false);
+            // (optional) delete obj.src  # No longer needed.
+            } else if (obj.children != null) {
+              // Find or create the logical scope.
+              if (logicalScope.children[obj.ident] != null) {
+                logicalChild = logicalScope.children[obj.ident];
+              } else {
+                logicalChild = new LogicalScope(this);
+                // Add to parent (regardless of whether it contains VIZ).
+                logicalScope.children[obj.ident] = logicalChild;
+              }
+              // Recurse
+              child = this.prepModel(obj, logicalChild);
+              if (child) {
+                children.push(child);
+                childHasVizJS |= child.hasVizJS;
+                childHasVizAlpha |= child.hasVizAlpha;
+              }
+            }
+            hasVizJS |= childHasVizJS;
+            hasVizAlpha |= childHasVizAlpha;
+          }
+          // Declare a default VizBlock if a child has a \viz_js block.
+          if (hasVizJS && (viz_js == null)) {
+            viz_js = new VizBlock(this, "", false, has_range, false);
+          }
+          //if hasVizJS or hasVizAlpha
+          // Regardless of whether we need this for VIZ, we create it because this scope may provide a range that must
+          // be inherited by a matching parse scope that does have VIZ. Also, we might add other uses of this hierarchy.
+          // If we add this conditionally, consider also the code above that adds a new LogicalScope to its parent.
+          if (true) {
+            // Need this scope for VIZ.
+            ret = new ParseScope(model);
+            ret.children = children;
+            ret.hasVizJS = hasVizJS;
+            ret.hasVizAlpha = hasVizAlpha;
+            ret.viz_js = viz_js;
+            ret.viz_alpha = viz_alpha;
+            // Add to logical scope.
+            logicalScope.addParseScope(ret);
+          }
+          return ret;
+        }
+
+        /*
+        Re-render the canvas at newCyc and update @cyc.
+        @param {int} newCyc The new value for @cyc.
+        */
+        updateCycle(newCyc) {
+          var wasRendered;
+          wasRendered = this.renderedCyc !== null;
+          if (wasRendered) {
+            this.unrender();
+          }
+          this.cyc = newCyc;
+          if (wasRendered) {
+            return this.render();
+          }
+        }
+
+        /*
+        Render an unrendered view.
+        */
+        render() {
+          this._renderCnt += 1;
+          // Clear active render timeout.
+          if (this.animateInterval !== null) {
+            clearTimeout(this.animateInterval);
+            this.animateInterval = null;
+          }
+          this.oldTopInstance.render([], this);
+          this.topInstance.render([], this);
+          this.renderedCyc = this.cyc;
+          // Initial render for the new cycle. Animation may renderAll subsequently.
+          return this.vizGlobal.canvas.renderAll();
+        }
+
+        // Unrender if necessary.
+        unrender() {
+          if ((this.renderedCyc !== null) && (this.oldTopInstance !== null)) {
+            this.oldTopInstance.render([], this, true);
+          }
+          if ((this.renderedCyc !== null) && (this.topInstance !== null)) {
+            this.topInstance.render([], this, true);
+          }
+          this.lastRenderCyc = this.renderedCyc;
+          return this.renderedCyc = null;
+        }
+
+      };
+
+      // @property {ServerCompile} the associated ServerCompile.
+      VizPane.prototype.compiler = null;
+
+      // @property {ParseScope} the parse model for VIZ corresponding to /top (created by prepModel).
+      VizPane.prototype.model = null;
+
+      // @property {LogicalScope} the logical model for VIZ corresponding to /top.
+      VizPane.prototype.logicalModel = null;
+
+      // @property {int, null} the ID of the most recent compilation.
+      VizPane.prototype.lastCompileID = null;
+
+      // @property {int, null, "loaded"} the ID of the last received waveData. "loaded" for waveforms loaded from file.
+      VizPane.prototype.vcdCompileID = null;
+
+      // @property {int, null} the ID of the last received parse model.
+      VizPane.prototype.parseModelCompileID = null;
+
+      // @property {Object} Stuff made visible to \viz* functions.
+      VizPane.prototype.vizGlobal = null;
+
+      // @property {VizInstanceContext} The {VizInstanceContext} for /top.
+      VizPane.prototype.oldTopInstance = null;
+
+      VizPane.prototype.topInstance = null;
+
+      // @property {Object<LogicalInstance>} LogicalInstances referenced by \viz* functions, indexed by their full indexed path.
+      VizPane.prototype.logicalInstances = null;
+
+      // Rendering state.
+
+      // @property {int} The current cycle.
+      VizPane.prototype.cyc = null;
+
+      // @property {int, null} The currently rendered cycle or null.
+      VizPane.prototype.renderedCyc = null;
+
+      // @property {int, null) The previously rendered cycle or null.
+      VizPane.prototype.lastRenderCyc = null;
+
+      // @property {int, null} Incremented for each render.
+      VizPane.prototype._renderCnt = 0;
+
+      // @property {int} Max animate date (after which we stop rerendering for animation).
+      VizPane.prototype.maxAnimateTime = 0;
+
+      // @property {int, null} The ID of the animation interval. Cleared for each render.
+      VizPane.prototype.animateInterval = null;
+
+      // @property {boolean} Whether there is an active immediate animation interval.
+      //                     If not, a new immediate animation will replace a non-immediate one.
+      VizPane.prototype.immediateAnimate = false;
+
+      // @property {WaveData} The WaveData ready for use once both vcd and parse model are available.
+      VizPane.prototype.readyWaveData = null;
+
+      // @property {Boolean} Whether simulation is enabled. This is set synchronously by the project (not by compilation events).
+      //   It's a bit tricky to sequence transitions properly in the face of in-flight compilations which have "parse model" and "vcd"
+      //   events that trigger VIZ updates. New compilations may cause these to fail, emitting fail events.
+      //   We take the following approach:
+      //     - gotCompileResults(..) is called by simulation and project events to determine whether to refresh VIZ
+      //       based on current project simulation enabled and compilation's simulation enabled.
+      //     - Compilations are launched with simulation disabled if the project has simulation disabled at the time.
+      //     - Compilation ID is passed from the server for all events.
+      //     - Simulation-enabled is echoed by "newcompile" event from server and recorded with {Compilation}.sim.
+      //     - VIZ and WAVEFORM listen for fail events and reflect failed status ("X") with no other updates.
+      //       (I think VIZ can get updated while WAVEFORM fails, thus using stale WaveData.)
+      //     - VCD results (both passed and failed) are squashed if locked.
+      //     - VCD locking/loading refreshes VIZ immediately. (This is needed for VCD locking in case we're waiting
+      //       for VCD data to trigger a refresh.)
+      //     - "parse model" results refresh VIZ immediately when VCD is locked.
+      //     - VCD unlocking sets WAVEFORM status to "failed", indicating possible inconsistency.
+      // TODO: This would be a little cleaner using {Compilation} objects (in ServerCompile.coffee) (WIP)
+      VizPane.prototype.simulationEnabled = true;
+
+      // @property {String} The default top level \viz_alpha block to use if no \viz_alpha blocks are present.
+      VizPane.prototype.defaultVizSrc = `init() {
+  let notice = new fabric.Text(
+    "This model has no visualization.\\nSee LEARN menu for docs.",
+    {fontSize: 20, top: -30, left: -160}
+  )
+  return {notice}
+}`;
+
+      return VizPane;
+
+    }).call(this);
+    ParseScope = (function() {
+      class ParseScope {
+        /*
+        Construct a new ParseScope. Do not process the children. `type` must be one of "BEH_HIER" or "PIPELINE"
+        (not "VIZ_JS" or "VIZ_ALPHA").
+        @param {Object} raw The parse scope as generated by SandPiper.
+        */
+        constructor(raw) {
+          this.type = raw._typeof;
+          this.ident = raw.ident;
+          this._min_index = raw.min_index;
+          this._max_index = raw.max_index;
+          this.children = [];
+        }
+
+      };
+
+      // @property {String} the type of the object; one of "BEH_HIER", "PIPELINE"
+      ParseScope.prototype.type = null;
+
+      // @property {String} the identifier of the object. E.g. "/top", "|my_pipe"
+      ParseScope.prototype.ident = null;
+
+      // @property {int, String, null} (for behavioral scopes with range) right index of this parseScope as integer (required for VIZ) or expression string; use only to generate LogicalScope.min_index
+      ParseScope.prototype._min_index = null;
+
+      // @property {int, String, null} (for behavioral scopes with range) left index as integer (required for VIZ) or expression string; use only to generate LogicalScope.max_index
+      ParseScope.prototype._max_index = null;
+
+      // @property {Array<ParseScope>} the children
+      ParseScope.prototype.children = null;
+
+      // @property {VizBlock} constructed from the contained `\viz_js` block, or a default if any descendant has a \viz_js block or the top level has none
+      ParseScope.prototype.viz_js = null;
+
+      // @property {VizAlphaBlock, null} constructed from the contained `\viz_alpha` block; note that viz_alpha may remain null with \viz_alpha children.
+      ParseScope.prototype.viz_alpha = null;
+
+      // @property {boolean} (for "VIZ" type) whether a child has a viz_js block
+      ParseScope.prototype.hasVizJS = false;
+
+      // @property {boolean} (for "VIZ" type) whether a child has a viz_alpha block
+      ParseScope.prototype.hasVizAlpha = false;
+
+      // @property {LogicalScope} the corresponding `LogicalScope` (assigned by `LogicalScope.addParseScope`)
+      ParseScope.prototype.logicalScope = null;
+
+      return ParseScope;
+
+    }).call(this);
+    LogicalScope = (function() {
+      // A logical view of the VIZ data that combines matching hierarchies of `model`.
+      class LogicalScope {
+        constructor(pane1) {
+          var _ide_viz_pane;
+          this.pane = pane1;
+          this.parseScopes = [];
+          this.viz_blocks = {};
+          this.children = {};
+          this.userData = {};
+          _ide_viz_pane = this.pane;
+          this.lib = {
+            data: this.userData, // TODO: Deprecated.
+            // Specifically for '/scope' references within `lib`, which become `this.getScope('top').modelScope.logicalScope...`
+            getScope: function(scope) {
+              if (scope !== "top") {
+                console.log("Error: This getScope() function is only for use by TLV-style scope references.");
+              }
+              return {
+                modelScope: _ide_viz_pane.model
+              };
+            }
+          };
+          // TODO: Provide access to an instance.
+          this.lib.lib = this.lib; // For legacy references.
+        }
+
+        /*
+        Get the Object to provide for scope references (e.g. '/scope').
+        @return {Object} the object to provide for scope references
+        */
+        _refObj(instanceStr) {
+          var logicalInstance;
+          // Get or create the logicalInstance.
+          logicalInstance = this.pane.logicalInstances[instanceStr];
+          if (logicalInstance == null) {
+            logicalInstance = new LogicalInstance(instanceStr, this);
+            this.pane.logicalInstances[instanceStr] = logicalInstance;
+          }
+          return {
+            // Create the object to return.
+            data: logicalInstance.data,
+            lib: this.lib
+          };
+        }
+
+        /*
+        Add a parse scope to this logical scope.
+        @param {ParseScope} scope The parse scope to add.
+        */
+        addParseScope(scope) {
+          var k, lib, results, v;
+          // Bidirectionally link @ and scope.
+          this.parseScopes.push(scope);
+          scope.logicalScope = this;
+          // Initialize or verify consistent properties.
+          if (this.ident === null) {
+            this.ident = scope.ident;
+          } else if (this.ident !== scope.ident) {
+            console.log(`Warning: LogicalScope identifier mismatch (${this.ident} vs. ${scope.ident}).`);
+          }
+          if (this.type === null) {
+            this.type = scope.type;
+          } else if (this.type !== scope.type) {
+            console.log(`Warning: LogicalScope ${scope.ident} type mismatch. (${this.type} vs. ${scope.type}).`);
+          }
+          // For range bounds, be lenient and favor numeric values. Mismatch only for mismatched numerics. If strings mismatch, use either.
+          if (this.min_index === null) {
+            this.min_index = scope._min_index;
+          } else if (this.min_index !== scope._min_index) {
+            if (typeof scope._min_index === "number") {
+              if (typeof this.min_index === "number") {
+                if (this.min_index !== scope._min_index) {
+                  console.log(`Warning: LogicalScope min_index mismatch (${this.min_index} vs. ${scope._min_index}).`);
+                }
+              } else {
+                // Numeric value gets priority.
+                this.min_index = scope._min_index;
+              }
+            }
+          }
+          if (this.max_index === null) {
+            this.max_index = scope._max_index;
+          } else if (this.max_index !== scope._max_index) {
+            if (typeof scope._max_index === "number") {
+              if (typeof this.max_index === "number") {
+                if (this.max_index !== scope._max_index) {
+                  console.log(`Warning: LogicalScope max_index mismatch (${this.max_index} vs. ${scope._max_index}).`);
+                }
+              } else {
+                // Numeric value gets priority.
+                this.max_index = scope._max_index;
+              }
+            }
+          }
+          // Reflect the \viz_js block.
+          if (scope.viz_js != null) {
+            if (this.viz_blocks[scope.viz_js.name] != null) {
+              console.log(`Warning: LogicalScope ${scope.ident} has multiple \\viz_js blocks with the same name ('${scope.viz_js.name}').`);
+            } else {
+              this.viz_blocks[scope.viz_js.name] = scope.viz_js;
+            }
+            lib = scope.viz_js.viz.lib;
+            if (lib != null) {
+              if (lib instanceof Function) {
+                // This is a function. Call it to get the lib object.
+                lib = lib();
+              }
+// Shallow merge the `scope` property into `lib`.
+              results = [];
+              for (k in lib) {
+                v = lib[k];
+                if (indexOf.call(this.lib, k) >= 0) {
+                  console.log(`Warning: LogicalScope ${scope.ident} has conflicting properties (${k}) from \\viz_js 'scope' fields.`);
+                }
+                results.push(this.lib[k] = v);
+              }
+              return results;
+            }
+          }
+        }
+
+      };
+
+      // @property {String} the type of the object; one of "BEH_HIER", "PIPELINE", "VIZ_JS", "VIZ_ALPHA"
+      LogicalScope.prototype.type = null;
+
+      // @property {String} (for scopes) the identifier of the object. E.g. "/top", "|my_pipe"
+      LogicalScope.prototype.ident = null;
+
+      // @property {int, String, null} (for behavioral scopes with range) right index as integer (required for VIZ) or expression string
+      LogicalScope.prototype.min_index = null;
+
+      // @property {int, String, null} (for behavioral scopes with range) left index as integer (required for VIZ) or expression string
+      LogicalScope.prototype.max_index = null;
+
+      // @property {Array<ParseScope>} the corresponding `ParseScope`s.
+      LogicalScope.prototype.parseScopes = null;
+
+      // @property {Object} `\viz_js` blocks in this scope, indexed by `name`, as defined in `\viz_js` block
+      LogicalScope.prototype.viz_blocks = null;
+
+      // @property {Object} the children, as, {ident: LogicalScope}
+      LogicalScope.prototype.children = null;
+
+      // @property {Object} the merged `lib` objects from the `\viz_js` blocks; this is user-accessible as, e.g. '/scope'
+      LogicalScope.prototype.lib = null;
+
+      // @property {Object} [deprecated] scope reference data, accessible as, e.g., '/scope'.data.
+      LogicalScope.prototype.userData = null;
+
+      // @property {VizPane} the `VizPane`.
+      LogicalScope.prototype.pane = null;
+
+      return LogicalScope;
+
+    }).call(this);
+    LogicalInstance = (function() {
+      // For '/scope'.data. This is mapped by @pane.logicalInstances[path], where path is, e.g., "/my_hier[3]|my_pipe";
+      // "/my_hier[*]" is legal for data not associated with a specific instance.
+      class LogicalInstance {
+        constructor(path, logicalScope1) {
+          this.path = path;
+          this.logicalScope = logicalScope1;
+          this.data = {};
+        }
+
+      };
+
+      // @property {String} The path to this instance.
+      LogicalInstance.prototype.path = null;
+
+      // @property {Object} User data associated with this instance, accessed as `'/scope'.data` in \viz_js.
+      LogicalInstance.prototype.data = null;
+
+      // @property {LogicalScope} The logical scope corresponding to this instance.
+      LogicalInstance.prototype.logicalScope = null;
+
+      return LogicalInstance;
+
+    }).call(this);
+    VizPane.Grid = (function() {
+      // A class for representing 2D TLV hierarchy efficiently. The 2D hierarchy is represented
+      // as an image where each pixel provides a background color for a cell.
+      // TODO: Currenlty, this is just available to viz methods for manual use; it should
+      //       eventually be more tightly managed behind the scenes based on viz attributes.
+      class Grid {
+        /*
+        @param {Object} top the context provided to viz functions.
+        @param {VizJSContext} context The 'this' of viz functions.
+        @param {int} width The width in cells.
+        @param {int} height The height in cells.
+        @param {Object} imageOptions Options passed to fabric.Image(..)
+        */
+        constructor(top1, context1, width, height, imageOptions) {
+          var base;
+          this.top = top1;
+          this.context = context1;
+          this.imageOptions = imageOptions;
+          this.canvasEl = document.createElement("canvas");
+          this.canvasEl.width = width;
+          this.canvasEl.height = height;
+          this.imageOptions.width = width;
+          this.imageOptions.height = height;
+          if ((base = this.imageOptions).imageSmoothing == null) {
+            base.imageSmoothing = false; // Default imageSmoothing to false, rather than true.
+          }
+        }
+
+        
+          // Get the corresponding fabricJS Object (which is created lazily).
+        getFabricObject() {
+          if (this._imageEl === null) {
+            this._imageEl = document.createElement("img");
+          }
+          this._imageEl.src = this.canvasEl.toDataURL();
+          if (this.fabricImage === null) {
+            this.fabricImage = new fabric.Image(this._imageEl, this.imageOptions);
+          }
+          // Image loads asynchronously (even though it is from data). I couldn't
+          //   get the fabric.Image callback/onload to work, but using the
+          //   HTMLImageElement event seems to work
+          this._imageEl.onload = () => {
+            this.fabricImage.setCoords();
+            return this.context._viz.pane._renderNeeded(true);
+          };
+          return this.fabricImage;
+        }
+
+        /*
+        Converts the canvas to an HTMLImageElement (as PNG).
+        */
+        toImage() {
+          var image;
+          image = document.createElement("img");
+          image.src = canvas.toDataURL("image/gif");
+          return image;
+        }
+
+        /*
+        Set the color of a cell (pixel).
+        @param {int} x
+        @param {int} y
+        */
+        setCellColor(x, y, color) {
+          var ctx;
+          ctx = this.canvasEl.getContext("2d");
+          ctx.fillStyle = color;
+          return ctx.fillRect(x, y, 1, 1);
+        }
+
+      };
+
+      // @property {Object} the context provided to viz functions.
+      Grid.prototype.top = null;
+
+      // @property {VizJSContext} the 'this' of viz functions.
+      Grid.prototype.context = null;
+
+      // @property {HTMLCanvasElement} A canvas for the image.
+      Grid.prototype.canvasEl = null;
+
+      // @property {Object} Options passed to fabric.Image(..)
+      Grid.prototype.imageOptions = null;
+
+      // @property {HTMLImageElement} An image element that is an intermediate step
+      //             between the canvas and the fabricJS Object.
+      Grid.prototype._imageEl = null;
+
+      // @property {fabric.Object} The corresponding fabricJS Image Object.
+      Grid.prototype.fabricImage = null;
+
+      return Grid;
+
+    }).call(this);
+    VizPane.ScalableFabric = (function() {
+      /*
+      FabricJS-specific scalable context.
+      */
+      class ScalableFabric extends Pane.ScalableContent {
+        /*
+        Constructor.
+        @param {Pane} pane the pane
+        @param {Number} scale (optional) the initial scale (presumably from previous content)
+        @param {Object} focus (specified along w/ scale) the initial focus point (presumably from
+                              previous content)
+        */
+        constructor(pane, scale, focus) {
+          super(pane);
+          this.canvas = new fabric.Canvas('canvas', {
+            imageSmoothingEnabled: false
+          });
+          this.canvas.renderOnAddRemove = false;
+          //@canvas.centeredScaling = true
+          this.contentValid = true;
+          this.userBounds = new Pane.Rect().set(-1000, -1000, 2000, 2000);
+          if (typeof scale !== "undefined") {
+            this.setContentScale(scale, false);
+            this.focusContentOn(focus.x, focus.y, false);
+            this.is_first = false;
+          }
+          this.positionNewContent();
+        }
+
+        destroy() {
+          return this.canvas.dispose();
+        }
+
+        // TODO: There seems to be an issue with active animations. I couldn't find a fix in Fabric 4.5.0.
+
+          // Resize the canvas, preserving the focus in the center.
+        resize(width, height) {
+          // Canvas is positioned in the upper-left of its container, and must be resized to fit its
+          // space.
+          this.canvas.setWidth(width);
+          this.canvas.setHeight(height);
+          // Set focus in center.
+          if (this.contentValid) {
+            return this.refreshContentPosition();
+          }
+        }
+
+        /*
+        Reflect the content position/scale in the DOM.
+        */
+        refreshContentPosition() {
+          var pan;
+          this.canvas.setZoom(this.contentScale);
+          pan = new fabric.Point(this.userFocus.x * this.canvas.getZoom() - this.canvas.getWidth() / 2.0, this.userFocus.y * this.canvas.getZoom() - this.canvas.getHeight() / 2.0);
+          this.canvas.absolutePan(pan);
+          return this.canvas.renderAll();
+        }
+
+        /*
+        Converts number of pixels to user units
+        @param {Number} px the dimension (or distance) in pixels
+        @return {Number} the resulting number of user units
+        */
+        pixelsToUserUnits(px) {
+          return px / this.contentScale;
+        }
+
+      };
+
+      ScalableFabric.prototype.canvas = null;
+
+      return ScalableFabric;
+
+    }).call(this);
+    VizElement = (function() {
+      class VizElement {
+        /*
+        Constructor. Recursively processes user's template, and init() from submodel
+        and creates a fabric.Group for each instance containing the resulting Objects and children Groups.
+        @param parent {VizScopeContext} Containing {VizScopeContext}
+        @param index {int}  The index for VizInstanceElements with a range; null for VizInstanceElements without a range (this case is to be removed); undefined for VizScopeElements
+        @param modelScope {ParseScope} The {ParseScope} containing this {VizElement}
+        @param pane {VizPane} The {VizPane}
+        @param scopes {Object} The {VizElement} for ancestor scopes, indexed by name
+
+        TODO: The 'scopes' parameter is legacy, as are @initScopes and @doneScopes. They were an optimized way
+              to access scopes, maintained during traversal, but they do not work for asynchronous calls.
+              VizJSContext.getScope(..) has been updated not to use this, but it must be kept for legacy /viz_js code that
+              accesses it directly.
+        */
+        constructor(parent, index1, modelScope, pane1, scopes) {
+          var angle, angle_rad, box, boxLeft, boxLeftParent, boxTop, boxTopParent, centeringBox, centeringProps, child, cos, firstChildObjectIndex, group_left, group_opts, group_top, height, height_scale, i, ind, j, layout, left, name, obj, objects, objectsArray, ref, ref1, ref2, ref3, ref4, scale, sin, template_clone, testGroup, top, viz, viz_block, where, whereBoxParams, width, width_scale, xRadius, yRadius;
+          /*
+          Get the name of the corresponding TLV scope.
+          */
+          this.name = this.name.bind(this);
+          /*
+          New trace data. Call \viz_js onTraceData() for all instances.
+          TODO: Later, optimize by only calling once components are in view.
+          @param scopes {Object} The {VizElement} for each ancestor scope, indexed by name
+          */
+          this.onTraceData = this.onTraceData.bind(this);
+          /*
+          Prepares an object to be added to @objectsArray (and thus @group).
+          @param {Fabric.Object} The Object to be added.
+          @return {Fabric.Object} obj, after preparing it.
+          */
+          this._addedObject = this._addedObject.bind(this);
+          this.parent = parent;
+          this.index = index1;
+          this.modelScope = modelScope;
+          this.pane = pane1;
+          // Initialize.
+          this.depth = this.parent ? this.parent.depth + 1 : 0;
+          this.renderedObjects = [];
+          this.initObjects = {};
+          this.children = {};
+          this._children = [];
+          this.objectsArray = [];
+          this.initScopes(scopes);
+          this.init();
+          // Process \viz_js.
+          viz_block = this.getVizBlock();
+          viz = viz_block.viz;
+          box = viz.box;
+          // Create the context for this VizElement.
+          this.context = new VizJSContext(this, this.pane.vizGlobal);
+          // Evaluate preInit()
+          this.initResults = viz_block.invoke("preInit", this.context, scopes);
+          // Recurse
+          this.makeChildren(this.pane, scopes);
+          // Create objectsArray and add to it Fabric Objects from template and init.
+          // If the box is unbounded, we must use a testGroup, containing objectsArray, to determine its
+          // bounds.
+
+          // If box bounds are not both provided, determine bounds based on the Objects in the component
+          // (from template, init(), and child components). We do this by adding them to a temporary
+          // testGroup.
+          testGroup = null;
+          objectsArray = []; // (distinct from @objectsArray)
+          if (!box.bounded) {
+            // Use this test group to determine bounds.
+            // Associate objectArray now, while it is empty, so we can add to it without updates,
+            // then we'll use this group later to check bounds.
+            testGroup = new fabric.Group(objectsArray, {
+              originX: "left",
+              originY: "top"
+            });
+          }
+          // Evaluate init()
+          this.initResults = viz_block.invoke("init", this.context, scopes);
+          if (!this.initResults) {
+            this.initResults = {};
+          }
+          // Extract Fabric objects from result.
+          template_clone = {};
+          Object.keys(viz.template).map(function(name, index) {
+            var args, obj_type;
+            args = viz.template[name];
+            obj_type = args.shift();
+            template_clone[name] = new fabric[obj_type](...args);
+            return args.unshift(obj_type);
+          });
+          if (((ref = this.initResults) != null ? ref.objects : void 0) != null) {
+            console.log("\\viz_js init() returned \"objects\", which is for \\viz_alpha blocks.");
+          }
+          objects = Object.assign({}, template_clone, this.initResults);
+          if (!objects) {
+            objects = {};
+          }
+          for (name in objects) {
+            obj = objects[name];
+            this.initObjects[name] = obj;
+            objectsArray.push(obj);
+          }
+          // Add children Groups to this parent.
+          // In the unbounded case, we add to the testGroup Rects that represent the child wheres (child.whereBox)
+          // to account for children in the box bounds. The real children Groups do not accurately represent their bounds.
+
+          // The first index of child Rects or Groups.
+          firstChildObjectIndex = objectsArray.length;
+          // Determine the box.
+          if (!box.bounded) {
+            ref1 = this._children;
+            /*
+             * TODO: Move this optimization determination to prepModel() and support for array fill images also.
+             * Optimize bounds computation for VizScopeElement whose replicated VizInstanceElements have a
+             * "horizontal" or "vertical" layout starting with index 0, no 'all' property, no 'where0'
+             * property and a bounded child.
+
+            optimize = not @isInstance() and not @modelScope.viz_js?.all? and not @modelScope.viz_js?.where0?
+              and @modelScope.logicalScope.min_index is 0) and (@_children.length is 1)
+              and ((@children[0].getVizBlock().viz.layout is "horizontal") or (@children[0].getVizBlock().viz.layout is "vertical"))
+              and @children[0].getVizBlock().viz.width? and @children[0].getVizBlock().viz.height?
+            if optimize
+              box.left  = 0
+              box.right = 0
+              box.width  = @children[0].getVizBlock().viz.width
+              box.height = @children[0].getVizBlock().viz.height
+              if @children[0].getVizBlock().viz.layout is "horizontal"
+                box.width *= @modelScope.logicalScope.max_index
+              else if @children[0].getVizBlock().viz.layout is "vertical"
+                box.height *= @modelScope.logicalScope.max_index
+              else
+                console.log "BUG: Unrecognized layout property"
+            else
+             */
+            // Unoptimized (general) case.
+
+            // Add a Rect for each child where to account for children in the computed bounds.
+            // WhereBox must be visible to contribute to the area. We use "false" as a truthy value and
+            // check explicitly for true when adding for real, below.
+            for (ind in ref1) {
+              child = ref1[ind];
+              if (!child.whereBox.visible) {
+                child.whereBox.set("visible", "false");
+              }
+              objectsArray.push(child.whereBox);
+            }
+            // Need to make adjustments to the box that could be instance-dependent, so we
+            //   need to make a copy of box to modify it.
+            box = Object.assign({}, box);
+            testGroup._calcBounds(); // Determine width/height/left/top.
+            // Set box to contain bounds of the testGroup.
+            if (box.width == null) {
+              box.width = testGroup.getScaledWidth();
+            }
+            if (box.height == null) {
+              box.height = testGroup.getScaledHeight();
+            }
+            if (box.left != null) {
+              // Add any necessary width to account for given box.left.
+              box.width += testGroup.left - box.left;
+            } else {
+              box.left = testGroup.left;
+            }
+            if (box.top != null) {
+              // Add any necessary height to account for given box.top.
+              box.height += testGroup.top - box.top;
+            } else {
+              box.top = testGroup.top;
+            }
+            // Adjust the box to keep the stroke inside its bounds.
+            viz_block._fitBoxStroke(box);
+          }
+          // Slam the box into the back of the Group.
+          this.initObjects.box = new fabric.Rect(box);
+          width = this.initObjects.box.width + this.initObjects.box.strokeWidth;
+          height = this.initObjects.box.height + this.initObjects.box.strokeWidth;
+          objectsArray.unshift(this.initObjects.box);
+          firstChildObjectIndex++;
+          // Fit this component's instances into their parent.
+          where = viz.where;
+          // Determine layout.
+          layout = viz.layout;
+          if (!layout) {
+            layout = height < width ? "vertical" : "horizontal";
+          }
+          // Determine left/top/angle.
+          // This includes applying offsets for replicated instances.
+          left = where.left;
+          top = where.top;
+          // Provide default values for where.left/top that preserve the position
+          // (thus components with no where share their parent's coordinate system).
+          if (left == null) {
+            left = box.left;
+          }
+          if (top == null) {
+            top = box.top;
+          }
+          angle = where.angle;
+          if (typeof this.index === "number") {
+            // Replicated.
+            if (typeof layout === "string") {
+              if (layout === "horizontal") {
+                left += this.index * width;
+              } else if (layout === "vertical") {
+                top += this.index * height;
+              } else {
+                Utils.assert(false, `Invalid layout: \"${layout}\".`);
+              }
+            } else {
+              // Non-string layout property.
+              // left
+              if (typeof layout.left === "number") {
+                left += this.index * layout.left;
+              } else if (layout.left instanceof Function) {
+                left += layout.left(this.index);
+              }
+              // top
+              if (typeof layout.top === "number") {
+                top += this.index * layout.top;
+              } else if (layout.top instanceof Function) {
+                top += layout.top(this.index);
+              }
+              // angle
+              if (typeof layout.angle === "number") {
+                angle += this.index * layout.angle;
+              } else if (layout.angle instanceof Function) {
+                angle += layout.angle(this.index);
+              }
+            }
+          }
+          // Determine scale.
+          scale = 2e308;
+          if (where.scale) {
+            scale = where.scale;
+          }
+          if (where.width) {
+            width_scale = where.width / width;
+            if (width_scale < scale) {
+              scale = width_scale;
+            }
+          }
+          if (where.height) {
+            height_scale = where.height / height;
+            if (height_scale < scale) {
+              scale = height_scale;
+            }
+          }
+          if (scale === 2e308) {
+            scale = 1;
+          }
+          // Convincing Fabric to put the 'box' in the 'where' position is a bit tricky.
+          // Fabric likes to adjust the coordinate system of the Group to keep (0,0) in the center of the Group.
+          // We need a consistent coordinate system. So we construct the Group with a 'centeringBox'. This is
+          // a transparent Rect whose center is at (0,0) that is big enough to encompass the 'box'. In reality
+          // we don't need this Rect to exist, we just need to set the Groups width and height to include it.
+
+          // With the centeringBox's (and Group's) coordinates centered at (0,0), it is easiest to use
+          // originX/Y = "center" to position the box. If the box's left/top is (0,0) and the box uses default
+          // "left"/"top" justification, the Group's left/top is the box's left/top (for any angle). For non-zero
+          // box left/top, the Group left/top must be adjusted by box left/top mappeded into the parent. For
+          // non-default justification, we can use the box's left/top adjusted accordingly.
+
+          // Box.left/top adjusted for justification.
+          boxLeft = box.left;
+          boxTop = box.top;
+          if ((where.justifyX !== "left") && (where.width != null)) {
+            boxLeft -= ((where.width / scale) - width) * (where.justifyX === "center" ? 0.5 : 1);
+          }
+          if ((where.justifyY !== "top") && (where.height != null)) {
+            boxTop -= ((where.height / scale) - height) * (where.justifyY === "center" ? 0.5 : 1);
+          }
+          // Box.left/top in parent coords, initially adjusting for angle, but not scale.
+          if (angle) {
+            // Angled computation.
+            angle_rad = angle * Math.PI / 180;
+            sin = Math.sin(angle_rad);
+            cos = Math.cos(angle_rad);
+            boxLeftParent = boxLeft * cos - boxTop * sin;
+            boxTopParent = boxLeft * sin + boxTop * cos;
+          } else {
+            // No angle. Avoid the trigonometry.
+            boxLeftParent = boxLeft;
+            boxTopParent = boxTop;
+          }
+          // Apply scale.
+          boxLeftParent *= scale;
+          boxTopParent *= scale;
+          group_left = left - boxLeftParent;
+          group_top = top - boxTopParent;
+          // Slam another Rect into the back of the Group to keep the center at 0,0,
+          // or we don't actually need the Rect. We can instead simply set the Group's width/height.
+          xRadius = Math.max(-box.left, box.left + width);
+          yRadius = Math.max(-box.top, box.top + height);
+          if (false) { // true to show centeringBox
+            centeringProps = {
+              left: -xRadius,
+              top: -yRadius,
+              width: xRadius * 2,
+              height: yRadius * 2,
+              strokeWidth: 0,
+              fill: "#00000020" // "transparent"
+            };
+            centeringBox = new fabric.Rect(centeringProps);
+            objectsArray.unshift(centeringBox);
+            firstChildObjectIndex++;
+          }
+          // Now that we know group properties, set them.
+          group_opts = {
+            selectable: false,
+            width: xRadius * 2, // (need 0,0 at the center, encompassing the box)
+            height: yRadius * 2, // (need 0,0 at the center, encompassing the box)
+            left: group_left, // if centeringBox then left else group_left
+            top: group_top, // if centeringBox then top else group_top
+            angle,
+            scaleX: scale,
+            scaleY: scale,
+            originX: "center", // where.originX,
+            originY: "center" // where.originY,
+          };
+          // Construct the group for this component of objectsArray objects, without updating their
+          // coordinates to center the objects as Fabric would normally do.
+          this.group = new fabric.Group(this.objectsArray, group_opts);
+          // Also set @whereBox, providing a fabric.Rect representing the where area in the parent.
+          //   (This is only needed if the parent is unbounded or the where box is visible.)
+          whereBoxParams = Object.assign({
+            visible: false,
+            width: width * scale,
+            height: height * scale,
+            strokeWidth: 0,
+            fill: "#80808060"
+          }, where, {
+            left,
+            top,
+            scaleX: 1,
+            scaleY: 1
+          });
+          // Adjust whereBox to contain stroke within width/height.
+          if (whereBoxParams.strokeWidth != null) {
+            whereBoxParams.width -= whereBoxParams.strokeWidth;
+            whereBoxParams.height -= whereBoxParams.strokeWidth;
+          }
+          this.whereBox = new fabric.Rect(whereBoxParams);
+// Add Objects to @group, excluding child whereBoxes.
+          for (i = j = 0, ref2 = firstChildObjectIndex - 1; (0 <= ref2 ? j <= ref2 : j >= ref2); i = 0 <= ref2 ? ++j : --j) {
+            this.objectsArray[i] = this._addedObject(objectsArray[i]);
+          }
+          ref3 = this._children;
+          // Add visible where boxes.
+          // Create and add where boxes (layered below all child.group's).
+          for (ind in ref3) {
+            child = ref3[ind];
+            // Note, we're not removing this object from testGroup (if there is one), which seems okay with our hacks.
+            if (child.whereBox.visible === true) {
+              this.objectsArray.push(this._addedObject(child.whereBox));
+            }
+          }
+          ref4 = this._children;
+          // Add child Groups to @group.
+          for (ind in ref4) {
+            child = ref4[ind];
+            this.objectsArray.push(this._addedObject(child.group));
+          }
+          // Done.
+          this.doneScopes(scopes);
+        }
+
+        /*
+        Return true for VizInstanceElements that represent a replicated element within a replicated scope.
+        (A non-replicated scope also has a VizInstanceElement, generally not a VizScopeElement.)
+        */
+        isReplica() {
+          var ref;
+          return this.modelScope === ((ref = this.parent) != null ? ref.modelScope : void 0);
+        }
+
+        name() {
+          return this.modelScope.ident.substring(1); // All relevant identifiers have a single prefix character.
+        }
+
+        /*
+        Update scopes to reflect this scope (if this is a VizScopeElement).
+        @param name {String,int} As in constructor.
+        @param scopes {Object} As in constructor.
+        */
+        initScopes(name, scopes) {}
+
+        /*
+        Compliment to initScopes.
+        @param name {String,int} As in constructor.
+        @param scopes {Object} As in constructor.
+        */
+        doneScopes(name, scopes) {}
+
+        /*
+        Called early on by constructor.
+        */
+        init() {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        Recurse into children scopes.
+        @param pane {VizPane} The {VizPane}
+        @param scopes {Object} As in constructor.
+        */
+        makeChildren(pane, scopes) {
+          return Utils.abstractMethod();
+        }
+
+        onTraceData(scopes) {
+          var child, ind, name, obj, ref, ref1, rslt, viz_block;
+          this.initScopes(scopes);
+          ref = this._children;
+          // Recurse.
+          for (ind in ref) {
+            child = ref[ind];
+            child.onTraceData(scopes);
+          }
+          // Invoke \viz_block's onTraceData and process results.
+          viz_block = this.getVizBlock();
+          rslt = viz_block.invoke("onTraceData", this.context, scopes);
+          if ((rslt != null ? rslt.objects : void 0) != null) {
+            ref1 = rslt.objects;
+            for (name in ref1) {
+              obj = ref1[name];
+              this.initObjects[name] = obj;
+              this.objectsArray.push(this._addedObject(obj));
+            }
+          }
+          return this.doneScopes(scopes);
+        }
+
+        _addedObject(obj) {
+          obj.group = this.group;
+          return obj;
+        }
+
+        /*
+        Render (make updates to) or unrender the canvas to reflect or unreflect the current cycle.
+        Add to the component the Fabric.Objects returned from the \viz_js render() function (or remove them if unrendering)
+        Capture these objects in @renderedObjects.
+        @param {Object} scopes As in constructor.
+        @param {VizPane} pane The {VizPane}.
+        @param {Boolean} un unrender if truthy.
+        */
+        render(scopes, pane, un) {
+          var child, color, fnName, ind, j, len, obj, ref, ref1, rslt, viz_js;
+          Utils.assert(!un === (pane.renderedCyc === null));
+          this.initScopes(scopes);
+          viz_js = this.getVizBlock();
+          if (!un) {
+            viz_js.invoke("preRender", this.context, scopes);
+          }
+          ref = this._children;
+          // Recurse
+          for (ind in ref) {
+            child = ref[ind];
+            child.render(scopes, pane, un);
+          }
+          fnName = un ? "unrender" : "render";
+          // renderFill()
+          if (!un) {
+            color = viz_js.invoke("renderFill", this.context, scopes);
+            if (color) {
+              this.initObjects.box.set("fill", color);
+            }
+          }
+          rslt = viz_js.invoke(fnName, this.context, scopes);
+          if (un) {
+            // Remove rendered objects from canvas.
+            // Note that these objects were added through an unofficial mechanism, but this seems to remove them properly.
+            this.group.remove(...this.renderedObjects);
+            this.renderedObjects = [];
+          } else {
+            if (rslt && rslt.constructor === Array) {
+              this.renderedObjects.push(...rslt);
+              ref1 = this.renderedObjects;
+              for (j = 0, len = ref1.length; j < len; j++) {
+                obj = ref1[j];
+                // Add objects into the group.
+                // console.log("Added rendered object: #{obj.debug_name}")
+                this.objectsArray.push(this._addedObject(obj));
+              }
+            } else {
+
+            }
+          }
+          return this.doneScopes(scopes);
+        }
+
+        /*
+        Return true if this is a VizInstanceElement, false if this is a VizScopeElement.
+        */
+        isInstance() {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        Return the VizBlock for this VizElement.
+        */
+        getVizBlock() {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        @param {Fabric.Object} a Fabric.Object (or Object with any of {scale, scaleX, scaleY})
+        @return the scale of a Fabric.Object that must be scaled proportionally.
+        */
+        getScale(obj) {
+          var ret;
+          ret = obj.scale;
+          if (typeof ret !== "number") {
+            Utils.assert(obj.scaleX === obj.scaleY, "Transforming Fabric.Object with different scaleX/Y values, which is not currently supported.");
+            ret = obj.scaleX != null ? obj.scaleX : 1;
+          }
+          return ret;
+        }
+
+        /*
+        Translate {left, top, angle, scale} from within this {VizElement} into @parent.
+        (Fabric has functions for this, but this is more specific to VIZ.)
+        @param {Object} props {left, top, angle [default: 0], scale (or equivalent scaleX/Y) [default: 1]}
+        @return {Object} {left, top, angle, scale (and equivalent scaleX/Y)}
+        */
+        upMap(props) {
+          var angle_rad, cos, propsScale, radiusLeft, radiusTop, ret, sin;
+          Utils.assert(this.group.scaleX === this.group.scaleY, "Component has differing scaleX and scaleY which isn't supported.");
+          // Assign return value initially without adjusting for angle.
+          propsScale = this.getScale(props);
+          radiusLeft = props.left * this.group.scaleX;
+          radiusTop = props.top * this.group.scaleX;
+          ret = {};
+          // Spin ret.left/top by @group.angle around @group.left/top.
+          if (this.group.angle) {
+            angle_rad = this.group.angle * Math.PI / 180;
+            sin = Math.sin(angle_rad);
+            cos = Math.cos(angle_rad);
+            ret = {
+              left: this.group.left + radiusLeft * cos - radiusTop * sin,
+              top: this.group.top + radiusLeft * sin + radiusTop * cos
+            };
+          } else {
+            ret = {
+              // Optimized calculation for no angle
+              left: this.group.left + radiusLeft,
+              top: this.group.top + radiusTop
+            };
+          }
+          ret.angle = (props.angle ? props.angle : 0) + this.group.angle;
+          ret.scale = propsScale * this.group.scaleX;
+          return ret;
+        }
+
+        /*
+        Apply upMap(props) over multiple levels of hierarchy.
+        @param {VizElement} ancestor the ancestor {VizElement}
+        @param {Object} props as in upmap(props)
+        @return {Object} Mapped properties or null if ancestor not found.
+        */
+        ancestorMap(ancestor, props) {
+          var scope;
+          scope = this;
+          while (scope !== ancestor) {
+            props = scope.upMap(props, ancestor);
+            scope = scope.parent;
+            if (!scope) {
+              Utils.assert(false, "Ancestor not found.");
+              return null;
+            }
+          }
+          return props;
+        }
+
+        /*
+        @param {VizElement} ancestor the ancestor {VizElement} within which to uniquify this {VizElement}
+        @return {String} a string that uniquely identifies the instance of this \viz_js block within the given ancestor {VizElement}
+        TODO: Will require changes once the the {VizElement} hierarchy can differ from the model hierarchy (including multiple \viz_js
+              blocks per logical scope).
+        ##
+        uniquifierString: (ancestor) ->
+          return "" if @ is ancestor
+          ret = @parent.uniquifierString(ancestor)
+          i = @getIndex()
+          if (i isnt null)
+            ret += "_#{@getIndex()}"
+          return ret
+         */
+        /*
+        Given data with respect to another scope (other {VizElement}), traverse from that other
+        {VizElement} to this one, operating on the data along the way, and returning the resulting data.
+
+        @param {VizElement} other the other {VizElement}
+        @param {any} data the data to propagate upward from other
+        @param {function} upCB (opt) A function to be invoked on the other {VizElement} up to, but
+                               not including, the common ancestor that transforms the data from other
+                               parent scope to the common ancestor.
+        @param {function} downCB (opt) a function to be invoked after reaching the common ancestor
+                                 on the common ancestor's parent through @ that transforms the data
+                                 from the common ancestor's context to @ context.
+        @return the resulting transformed data
+        */
+        operateAlongPath(other, data, upCB, downCB) {
+          var downMap, parentData, ret, thisEl;
+          // Our current depth is defined by the greatest of @depth and other.depth.
+          // Recurse, one depth-- per call, to a common ancestor, calling upCB along the way
+          // once the other {VizElement} has been reached.
+          ret = null;
+          downMap = this.depth >= other.depth;
+          if (this.depth > other.depth) {
+            // Recurse into @parent without up-mapping to get to the level of other {VizElement}.
+            ret = this.parent.operateAlongPath(other, data, upCB, downCB);
+          } else {
+            if (other === this) {
+              // Done recursing.
+              return data;
+            }
+            // Transform data from other to other.parent.
+            parentData = upCB instanceof Function ? (upCB.bind(other))(data) : data;
+            thisEl = (this.depth === other.depth) ? this.parent : this;
+            ret = thisEl.operateAlongPath(other.parent, parentData, upCB, downCB);
+          }
+          // Return from recursion.
+          // Transform data through downCB.
+          if ((downCB instanceof Function) && downMap) {
+            return (downCB.bind(this))(ret);
+          } else {
+            return ret;
+          }
+        }
+
+        /*
+        Get the ancestor in common with @ and 'other'.
+        @param {VizElement} other the other {VizElement}
+        @return the common ancestor of this {VizElement} and 'other'
+        */
+        _commonAncestor(other) {
+          var downCB, ret, upCB;
+          upCB = function(data) {
+            return data;
+          };
+          downCB = function(data) {
+            if (data === null) {
+              return this.parent;
+            } else {
+              return data;
+            }
+          };
+          ret = this.operateAlongPath(other, null, upCB, downCB);
+          if (ret === null) {
+            ret = this;
+          }
+          return ret;
+        }
+
+        /*
+        Apply properties {left, top, angle, scale} with respect to this component to an object
+        in an ancestor scope.
+        WIP using Fabric transformation methods.
+        @param {VizElement} ancestorScope the ancestor scope
+        @param {String} objName object name
+        @param {Fabric.Object} referenceObject A Fabric.Object in this component to which to match objName in scopeName.
+                                               This Object may exist in this component, may be visible or not,
+                                               or may not be added to any component just for use as an argument.
+        */
+        positionAncestorObject_WIP(ancestorScope, objName, referenceObject) {
+          var forwardMatrixFrom, matrix, obj, props;
+          // Recursively call into scopeName. Return forward transformation matrix (from ancestorScope to @).
+          //   param {VizElement} toScope scope to which the returned matrix will transform (from ancestorScope)
+          forwardMatrixFrom = function(toScope) {
+            var debug, matrix;
+            debug = toScope.name();
+            matrix = toScope.group.calcTransformMatrix();
+            if (ancestorScope !== toScope.parent) {
+              matrix = fabric.util.multiplyTransformMatrices(forwardMatrixFrom(toScope.parent), matrix);
+            }
+            console.log(`Transforming through: ${debug}`);
+            return matrix;
+          };
+          // Determine the matrix that will transform from ancestorScope to this VizElement.
+          console.log("------");
+          matrix = forwardMatrixFrom(this);
+          matrix = fabric.util.multiplyTransformMatrices(matrix, referenceObject.calcOwnMatrix());
+          //-invMatrix = fabric.util.invertTransform(matrix)
+          props = fabric.util.qrDecompose(matrix);
+          props.left = props.translateX;
+          props.top = props.translateY;
+          // Apply transformed properties.
+          obj = ancestorScope.initObjects[objName];
+          if (obj) {
+            return obj.set(props);
+          } else {
+            return Utils.assert(false, "Couldn't find Fabric.Object named \"objName\".");
+          }
+        }
+
+        /*
+        Apply properties {left, top, angle, scale, width, height, originX, originY} with respect to this component to an object
+        in an ancestor scope. If height and width are both given, scale the resulting object to fit within the
+        given bounds.
+        @param {VizElement} ancestor the ancestor scope
+        @param {Fabric.Object} obj
+        @param {Object} props {left, top, angle [default: 0], scale [default: 1] (or scaleX/scaleY), width (opt), height (opt), originX (opt), originY (opt)}
+                              with respect to this {VizElement}
+        */
+        positionAncestorObject(ancestor, obj, props) {
+          var ancestorDimension, ancestorProps, boundingDimension, scale, scalingFactor;
+          ancestorProps = props;
+          if (ancestor === this) {
+            // No mapping to do. Use props directly, except that we must apply scale to scaleX/Y.
+            scale = this.getScale(props);
+            if (ancestorProps.scaleX == null) {
+              ancestorProps.scaleX = scale;
+            }
+            if (ancestorProps.scaleY == null) {
+              ancestorProps.scaleY = scale;
+            }
+          } else {
+            // At least one level of mapping to apply. Map properties.
+            ancestorProps = this.ancestorMap(ancestor, props);
+            // Adjust ancestorProps.scale to be defined by given containing width/height.
+            if ((props.width != null) && (props.height != null)) {
+              scalingFactor = ancestorProps.scale / this.getScale(props);
+              boundingDimension = (props.height / props.width > obj.height / obj.width) ? "width" : "height";
+              ancestorDimension = props[boundingDimension] * ancestorProps.scale;
+              ancestorProps.scale = ancestorDimension / obj[boundingDimension];
+            }
+            // Apply ancestorProps and props.originX/Y to obj.
+            ancestorProps.scaleX = ancestorProps.scale;
+            ancestorProps.scaleY = ancestorProps.scale;
+            if (props.originX != null) {
+              ancestorProps.originX = props.originX;
+            }
+            if (props.originY != null) {
+              ancestorProps.originY = props.originY;
+            }
+          }
+          delete ancestorProps.scale;
+          return obj.set(ancestorProps);
+        }
+
+      };
+
+      // @property {VizPane} The VizPane containing this VizElement.
+      VizElement.prototype.pane = null;
+
+      // @property {VizElement} Containing {VizElement}.
+      VizElement.prototype.parent = null;
+
+      // @property {int} The index for VizInstanceElements (0 if no range); null for VizScopeElements.
+      VizElement.prototype.index = void 0;
+
+      // @property {Object} the corresponding parse model.
+      VizElement.prototype.modelScope = null;
+
+      // @property {int} the depth of this {VizElement} in its hierarchy (used to find common ancestor).
+      VizElement.prototype.depth = null;
+
+      // @property {Fabric.Rect} The Fabric.Rect corresponding to the \viz block's box property.
+      VizElement.prototype.box = null;
+
+      // @property {Object} A Fabric.Rect for this element's 'where' (for its parent).
+      VizElement.prototype.whereBox = null;
+
+      // @property {Fabric.Group} The Fabric.Group for this VizElement.
+      VizElement.prototype.group = null;
+
+      // @property {Object<VizElement>} Children, indexed by indentifier without prefix. This is a legacy construct, but is in use by examples.
+      VizElement.prototype.children = null;
+
+      // @property {Array<VizElement>} Children. For replicated elements, indices match the scope's indices, so this may not start at 0. So, be sure to iterate using `of`, not `in`!
+      VizElement.prototype._children = null;
+
+      // @property {Array<fabric.Object>} Array of fabric.js objects added to canvas by render(..).
+      VizElement.prototype.renderedObjects = null;
+
+      // @property {Object<fabric.Object>} Object containing fabric.js objects added to canvas by initObjects(..).
+      VizElement.prototype.initObjects = null;
+
+      // @property {Object<Fabric.Object>} Results of invoking \viz_js init().
+      VizElement.prototype.initResults = void 0;
+
+      // @property {Array<Fabric.Object>} The object array added to @group. This is directly updated to add objects to @group
+      // (@group.add and @group.addWithUpdate assume Object coords are in group's parent, and we assume them to be in @group coords).
+      VizElement.prototype.objectsArray = null;
+
+      // @property {VizJSContext} The VizJSContext.
+      VizElement.prototype.context = null;
+
+      return VizElement;
+
+    }).call(this);
+    /*
+    A VizElement for replicated scopes (aka, those with a range or with a \viz_js all property), representing all instances,
+    as defined by \viz_js all property (if present).
+    */
+    VizScopeElement = class VizScopeElement extends VizElement {
+      init() {
+        return null;
+      }
+
+      makeChildren(pane, scopes) {
+        var i, j, ref, ref1, results;
+        // Recurse into instances.
+        if ((this.modelScope.logicalScope.min_index != null) && (typeof this.modelScope.logicalScope.min_index === "number")) {
+          results = [];
+          for (i = j = ref = this.modelScope.logicalScope.min_index, ref1 = this.modelScope.logicalScope.max_index; (ref <= ref1 ? j <= ref1 : j >= ref1); i = ref <= ref1 ? ++j : --j) {
+            this._children[i] = new VizInstanceElement(this, i, this.modelScope, pane, scopes);
+            results.push(this.children[i] = this._children[i]);
+          }
+          return results;
+        } else {
+          this._children[0] = new VizInstanceElement(this, 0, this.modelScope, pane, scopes);
+          return this.children[""] = this._children[0];
+        }
+      }
+
+      isInstance() {
+        return false;
+      }
+
+      // (not necessary, but faster than super's method)
+      isReplica() {
+        return false;
+      }
+
+      getVizBlock() {
+        return this.modelScope.viz_js.all;
+      }
+
+    };
+    /*
+    A VizElement for an instance of a scope. Every scope has one of these, whether replicated or not.
+    */
+    VizInstanceElement = class VizInstanceElement extends VizElement {
+      initScopes(scopes) {
+        return scopes[this.name()] = this;
+      }
+
+      doneScopes(scopes) {
+        return delete scopes[this.name()];
+      }
+
+      init() {
+        return null;
+      }
+
+      makeChildren(pane, scopes) {
+        var child, i, j, len, name, ref, ref1, replicated, results;
+        ref = this.modelScope.children;
+        // Recurse, for every child scope.
+        results = [];
+        for (j = 0, len = ref.length; j < len; j++) {
+          child = ref[j];
+          if (child.hasVizJS) {
+            // Construct a child VizElement
+            replicated = (child.logicalScope.min_index != null) || (((ref1 = child.viz_js) != null ? ref1.all : void 0) != null);
+            name = child.ident.substring(1);
+            i = this._children.length;
+            //if @children[name]?
+            //  console.log("Multiple viz elements named #{name}. Support is WIP.")
+            //  name = name + "_"
+            this._children[i] = (replicated ? new VizScopeElement(this, null, child, pane, scopes) : new VizInstanceElement(this, 0, child, pane, scopes));
+            results.push(this.children[name] = this._children[i]);
+          } else {
+            results.push(void 0);
+          }
+        }
+        return results;
+      }
+
+      isInstance() {
+        return true;
+      }
+
+      getVizBlock() {
+        return this.modelScope.viz_js;
+      }
+
+    };
+    VizJSContext = (function() {
+      class VizJSContext {
+        constructor(_viz, global1) {
+          /*
+          Register objects to be rendered on the canvas. Available only from a render method. These objects will be
+          removed from the canvas prior to invoking corresponding unrender method.
+          @param {Array<fabric.Object>} Array of fabricJS objects.
+          */
+          //render: (objects) ->
+          //  @_viz.addRenderObjects(@global.canvas, objects)
+          /*
+          Add objects to the canvas (from init* methods), and make them available via getObject(..).
+          @param {Object<fabric.Objects>} Object containing fabricJS objects.
+          */
+          //initObjects: (objects) ->
+          //  @_viz.addInitObjects(@global.canvas, objects)
+          /*
+          Return the pipesignal {SignalValue}, specified by fully-scoped name and the time (in phases) of
+          the phase-zero version of the pipesignal. SandPiper turns \viz_js-context references into
+          calls to this method.
+          @param {String} name the full pipesignal name.
+          @param {Number} phaseOfPipestageZero the phase of the trace of the phase-zero
+                          version of the pipesignal.
+          @return {SignalValue, null} a {SignalValue} representing the signal at the requested time;
+                                      null if signal not found.
+          */
+          this.sigRef = this.sigRef.bind(this);
+          /*
+          Return a {SignalValue}, specified by name and (phase-granular) cycle offset.
+          TODO: Currently, SandPiper does not interpret '*sv_sig_name' references to call this.
+          @param {String} sig the full name of the signal.
+          @param {Number} cycOffset the offset from the current cycle at which to access the signal value.
+          @return {SignalValue, null} a {SignalValue} representing the signal at the requested time;
+                                      null if signal not found. (TODO: Should return NullSignalValue instead.)
+          */
+          this.sigVal = this.sigVal.bind(this);
+          this._viz = _viz;
+          this.global = global1;
+        }
+
+        /* Cusomize for particular @methodName.
+             if @methodName.startsWith("render")
+               @initObjects = null
+             else
+               @render = null
+             */
+        getCycle() {
+          return this._viz.pane.cyc;
+        }
+
+        steppedBy() {
+          if (this._viz.pane.cyc !== null && this._viz.pane.lastRenderCyc !== null) {
+            return this._viz.pane.cyc - this._viz.pane.lastRenderCyc;
+          } else {
+            return 0;
+          }
+        }
+
+        getGlobal() {
+          return this._viz.pane.vizGlobal;
+        }
+
+        getContext() {
+          return this._viz;
+        }
+
+        //getDefinition: -> @_viz.getVizBlock()
+        getScope(name) {
+          var ret;
+          // TODO: Currently, ret.name() does not have the prefix, though it should.
+          // Strip a prefix if it exists to permit proper references.
+          if (name.startsWith("/") || name.startsWith("|")) {
+            name = name.substring(1); // Remove prefix.
+          }
+          ret = this._viz;
+          if (name) {
+            while (ret.name() !== name) {
+              ret = ret.parent;
+            }
+          }
+          return ret;
+        }
+
+        getIndex(name) {
+          if (name) {
+            return this.getScope(name).index;
+          } else {
+            return this._viz.index;
+          }
+        }
+
+        getCanvas() {
+          return this.getGlobal().canvas;
+        }
+
+        getBox() {
+          return this.getObjects().box;
+        }
+
+        // These might be results for an instance or scope. TODO: Make a common base class.
+        fromInit() {
+          return this._viz.initResults; // Deprecated
+        }
+
+        fromRender() {
+          return this._viz.renderedResults; // Deprecated
+        }
+
+        getInitObject(name) {
+          return this._viz.initObjects[name];
+        }
+
+        getInitObjects() {
+          return this._viz.initObjects; // Deprecated
+        }
+
+        getObjects() {
+          return this._viz.initObjects;
+        }
+
+        get obj() {return this.getObjects()};
+
+        // Wraps a callback to only call fn if the render count hasn't changed and we haven't unrendered.
+        // Also does a this.getCanvas().requestRenderAll().
+        thenRender(fn, elseFn) {
+          var _renderCnt;
+          console.log("Warning: thenRender() is deprecated.");
+          _renderCnt = this._viz.pane._renderCnt;
+          return () => {
+            var f;
+            f = _renderCnt === this._viz.pane._renderCnt && this._viz.pane.renderedCyc !== null ? fn : elseFn;
+            if (f) {
+              f.apply(this, arguments);
+              return this.getCanvas().requestRenderAll();
+            } else {
+              return null;
+            }
+          };
+        }
+
+        /*
+        Assert that we are rendering.
+        Functions that are meaningful only while rendering at a particular cycle should call this.
+        @param {String} fnName the name of the function the user invoked
+        */
+        _renderOnly(fnName) {
+          if (!this._viz.initObjects) {
+            console.log(`Function ${fnName} should only be used while rendering a specific cycle.`);
+            debugger;
+            return null;
+          }
+        }
+
+        /*
+        Construct a new {SignalValueSet} from the given object of {SignalValue}s.
+        The {SignalValueSet} supports similar methods to {SignalValue} that operate on all signals in unison.
+        @param {Object} sigs The set of {SignalValue}s.
+        */
+        signalSet(sigs) {
+          return new SignalValueSet(sigs);
+        }
+
+        sigRef(name, phaseOfPipestageZero) {
+          var cyc, sig, sigName;
+          this._renderOnly();
+          // Convert phase to cycle
+          sigName = "TLV" + name;
+          sig = this._viz.pane.waveData.getSignalByName(sigName);
+          // TODO: Desire true, which will be a breaking change to use NonExistentSignalError.
+          //       (2 places)
+          if (false) {
+            if (sig === null) {
+              sig = this._viz.pane.waveData.getSignalByName("");
+            }
+          } else {
+            if (!sig) {
+              return null;
+            }
+          }
+          cyc = this.getCycle() - phaseOfPipestageZero / 2 + sig.cycle;
+          // TODO: sig.cycle doesn't consider B-phase.
+          return new SignalValue(sig, cyc);
+        }
+
+        /*
+        @deprecated by sigVal(..)
+        */
+        svSigRef(sig, cycOffset = 0) {
+          return this.sigVal(sig, cycOffset);
+        }
+
+        sigVal(sig, cycOffset = 0) {
+          var sigName;
+          this._renderOnly();
+          // Convert phase to cycle
+          sigName = "SV." + sig;
+          sig = this._viz.pane.waveData.getSignalByName(sigName);
+          // TODO: Desire true, which will be a breaking change to use NonExistentSignalError.
+          //       (2 places)
+          if (false) {
+            if (sig === null) {
+              sig = this._viz.pane.waveData.getSignalByName("");
+            }
+          } else {
+            if (!sig) {
+              return null;
+            }
+          }
+          // TODO: sig.cycle doesn't consider B-phase.
+          return new SignalValue(sig, this.getCycle() + cycOffset);
+        }
+
+        /*
+        Map a location within an object, given x/y proportion (0: left/top, 1: right/bottom) to a point (left/top) in its parent.
+        @return {Object} {left, top}
+        */
+        _mapPoint(x, y, obj) {
+          var angle_rad, cos, left, sin, top;
+          // Map to unangled coords.
+          x += obj.originX === "left" ? 0 : obj.originX === "right" ? -1 : -0.5;
+          y += obj.originY === "top" ? 0 : obj.originY === "bottom" ? -1 : -0.5;
+          x *= obj.getScaledWidth();
+          y *= obj.getScaledHeight();
+          if (obj.angle) {
+            // Angled computation.
+            angle_rad = obj.angle * Math.PI / 180;
+            sin = Math.sin(angle_rad);
+            cos = Math.cos(angle_rad);
+            left = x * cos - y * sin;
+            top = x * sin + y * cos;
+          } else {
+            left = x;
+            top = y;
+          }
+          return {left, top};
+        }
+
+        /*
+        This function should be used in place of "fabric.Image.fromURL(...)".
+        Be sure you have the right to use images.
+
+        Eg: my_img = newImageFromURL("http://domain.com/img.jpg", {width: 200, height: 100})
+
+        This function is needed because a Fabric.Image cannot be added to the canvas (or Group) until it has loaded asynchronously.
+        It returns a fabric.Object that can be safely included in the component (as a Group to which
+        the Image will be added once loaded). Prior to loading, a "where" object (a fabric.Rect or other fabric.Object
+        (which could be a Group)), will be shown in its place. It is this Object that could contribute to
+        the bounds of the component, not the resulting Image (which should, as for all elements, be contained
+        within the bounds of its component).
+        @param {String} url the URL of the image
+        @param {String} attribution Use of 3rd-party images may require attribution based on the terms of its license.
+            Proper attribution can be provided here. Do not use unlicensed images.
+        @param {fabric.Object} where (opt)
+            Either:
+            1) a fabric.Object to represent the Image before it is loaded; getScaledWidth()/getScaledHeight()
+               provide defaults for imgOptions.width/height
+            2) where properties representing the Image before it is loaded, similar to
+               where properties of \viz_js blocks; these properties also provided default Image properties
+        @param {Object} imgOptions (opt)
+            as for Fabric.Image; 'where' properties provide defaults for imgOptions; if either of scaleX/Y
+            is provided, scaling is explicit; otherwise, optional width/height properties
+            override those from 'where' and the resulting height/width bound the image (and its stroke), which is scaled proportionally to fit,
+            positioned according to its originX/Y
+        @return {fabric.Object} the fabric.Object (fabric.Group)
+        */
+        newImageFromURL(url, attribution, where, imgOptions = {}) {
+          var callback, group, height, imgOpts, rectOpts, width;
+          // Check attribution.
+          if (typeof attribution !== "string") {
+            console.log("newImageFromURL(..) requires an attribution argument.");
+            // For backward-compatibility--attribution arg added, so shift other args.
+            imgOptions = where;
+            where = attribution;
+            attribution = "";
+          }
+          imgOpts = {};
+          if (typeof where === "klass") {
+            imgOpts = Object.assign({}, imgOptions);
+          } else {
+            // where defines a Rect.
+
+            // Apply where properties as defaults for imgOpts.
+            // "crossOrigin" is required to avoid "tainting" the canvas (a browser feature to prevent leaking copyrighted content) which
+            // prevents the image from being exported.
+            imgOpts = Object.assign({
+              crossOrigin: "anonymous"
+            }, where, imgOptions);
+            // Create where Rect.
+            rectOpts = Object.assign({
+              strokeWidth: 1,
+              fill: "transparent",
+              stroke: "#80808080",
+              left: 0,
+              top: 0
+            }, where);
+            if ((rectOpts.width != null) && (rectOpts.height != null)) {
+              rectOpts.width -= rectOpts.strokeWidth;
+              rectOpts.height -= rectOpts.strokeWidth;
+            } else {
+              rectOpts.strokeWidth = 0;
+              rectOpts.visible = false;
+            }
+            where = new fabric.Rect(rectOpts);
+          }
+          // Width/height are not actual fabric.Image properties. Pull them out.
+          width = imgOpts.width;
+          height = imgOpts.height;
+          delete imgOpts.width;
+          delete imgOpts.height;
+          group = new fabric.Group([where]);
+          callback = (img) => {
+            var attrib, grp, left, prop, scaleHeightBy, scaleWidthBy, scaleXBy, scaleYBy, shadow, top, xScaling, yScaling;
+            // Scale to fit to width/height.
+            scaleXBy = scaleYBy = 1;
+            if ((imgOpts.scaleX != null) || (imgOpts.scaleY != null)) {
+              // Explicit scaling because at least one scaling dimension given. If the other is missing, it defaults to 1.
+              if (imgOpts.scaleX == null) {
+                imgOpts.scaleX = 1;
+              }
+              if (imgOpts.scaleY == null) {
+                imgOpts.scaleY = 1;
+              }
+            } else {
+              // Scale proportionally based on height/width.
+              xScaling = width != null;
+              yScaling = height != null;
+              if (xScaling || yScaling) {
+                scaleWidthBy = 2e308;
+                scaleHeightBy = 2e308;
+                if (xScaling) {
+                  if (width == null) {
+                    width = where.getScaledWidth();
+                  }
+                  scaleWidthBy = width / ((img.width + img.strokeWidth) * img.scaleX);
+                }
+                if (height != null) {
+                  if (height == null) {
+                    height = where.getScaledHeight();
+                  }
+                  scaleHeightBy = height / ((img.height + img.strokeWidth) * img.scaleY);
+                }
+                scaleXBy = scaleYBy = scaleWidthBy < scaleHeightBy ? scaleWidthBy : scaleHeightBy;
+              }
+            }
+            img.set({
+              scaleX: img.scaleX * scaleXBy,
+              scaleY: img.scaleY * scaleYBy
+            });
+            group.remove(where);
+            // Add to group. addWithUpdate(...) adds assuming canvas coords, and we want parent coords, so we
+            // temporarily detach the group.
+            grp = group.group;
+            group.group = null;
+            group.addWithUpdate(img);
+            // Add attribution string.
+            if (attribution) {
+              // Position at lower-right of image.
+              ({left, top} = this._mapPoint(0.97, 0.95, img));
+              shadow = new fabric.Shadow({
+                color: "gray",
+                blur: 5
+              });
+              prop = {
+                fill: "black",
+                stroke: "white",
+                strokeWidth: img.getScaledWidth() / 3000,
+                fontFamily: "Roboto",
+                fontWeight: 600,
+                fontSize: img.getScaledWidth() / 80,
+                left: left,
+                top: top,
+                originX: "left",
+                originY: "bottom",
+                opacity: 0.8
+              };
+              attrib = new fabric.Text(attribution, prop);
+              group.add(attrib);
+            }
+            group.group = grp;
+            return this._viz.pane._renderNeeded(true);
+          };
+          new fabric.Image.fromURL(url, callback, imgOpts);
+          return group;
+        }
+
+      };
+
+      //global: null
+      // @property {VizElement} the viz element for the invocation.
+      VizJSContext.prototype._viz = null;
+
+      // @property {Object<VizElement>} set during invocation only, to access ancestor VizElements by name.
+      VizJSContext.prototype.scopes = null;
+
+      return VizJSContext;
+
+    }).call(this);
+    VizBlock = (function() {
+      class VizBlock {
+        /*
+        @param {String} pane The {VizPane}.
+        @param {String} src The body of the \viz* block from VizPane.model.
+        @param {boolean} explicit Truthy if there is an explicit \viz_js block or all() for this VizBlock (in which case
+                                  there is a default stroke).
+        @param {Array<int>} range The range from the parse model (for its truthiness)
+        @param {boolean} fromAll True if this corresponds to an 'all' property (or missing all for replicated scope).
+        */
+        constructor(pane1, src, explicit, range, fromAll) {
+          var base, base1, base10, base11, base2, base3, base4, base5, base6, base7, base8, base9, ret, safeTemplate;
+          /*
+          Invokes instance-specific \viz* function in appropriate context.
+          @param {String} fn Name of function to invoke.
+          @param {VizElement} context The context to bind to 'this' in the function invocation.
+          @param {Object} scopes The {VizInstanceContext} for this and each parent scope, indexed by name, added
+                                 temporarily to 'context' only for invocation, then freed.
+          */
+          this.invoke = this.invoke.bind(this);
+          this.pane = pane1;
+          // Process the \viz block src into @viz Object. @viz.where is set to the appropriate where/where0
+          // based on replication.
+          if (fromAll) {
+            // Extract from 'all' property.
+            this.exec = nxCompiler.compileCode(`let viz = {${src}}; if (!viz.all) {viz.all = {}}; viz.all.where = viz.where; return viz.all;`);
+          } else {
+            // If replicated, 'where' is 'where0'
+            this.exec = nxCompiler.compileCode(`let viz = {${src}}; if (${!!range} || viz.all) {viz.where = viz.where0}; return viz`);
+          }
+          this.viz = this.exec.bind({})(VizBlock.staticSandboxEnv); // \viz block as an Object.
+          
+          // Consistency checks.
+          if (!fromAll) {
+            Utils.assert(!(this.viz.all && this.viz.all.where), "\\viz_js 'where' property should not be within the 'all' property.");
+            Utils.assert(!(this.viz.where0 && !this.viz.all), "\\viz_js 'where0' with no 'all' not allowed.");
+          }
+          Utils.assert(!(this.viz.where && this.viz.where.layout), "\\viz_js 'layout' property should not be within 'where'/'where0' property.");
+          // Apply defaults to @viz.
+          if ((base = this.viz).template == null) {
+            base.template = {};
+          }
+          if ((base1 = this.viz).where == null) {
+            base1.where = {};
+          }
+          //@viz.where.top ?= 0
+          //@viz.where.left ?= 0
+          if ((base2 = this.viz.where).angle == null) {
+            base2.angle = 0;
+          }
+          //@viz.where.scale ?= 1.0
+          if ((base3 = this.viz.where).originX == null) {
+            base3.originX = "left"; // (top-level is provided as "center", )
+          }
+          if ((base4 = this.viz.where).originY == null) {
+            base4.originY = "top"; //  "
+          }
+          if ((base5 = this.viz.where).justifyX == null) {
+            base5.justifyX = "left";
+          }
+          if ((base6 = this.viz.where).justifyY == null) {
+            base6.justifyY = "top";
+          }
+          if ((base7 = this.viz).box == null) {
+            base7.box = {};
+          }
+          // Provide box properties specified outside of box property.
+          if (this.viz.width != null) {
+            this.viz.box.width = this.viz.width;
+          }
+          if (this.viz.height != null) {
+            this.viz.box.height = this.viz.height;
+          }
+          if (this.viz.left != null) {
+            this.viz.box.left = this.viz.left;
+          }
+          if (this.viz.top != null) {
+            this.viz.box.top = this.viz.top;
+          }
+          if (this.viz.fill != null) {
+            this.viz.box.fill = this.viz.fill;
+          }
+          if (this.viz.stroke != null) {
+            this.viz.box.stroke = this.viz.stroke;
+          }
+          if (this.viz.strokeWidth != null) {
+            this.viz.box.strokeWidth = this.viz.strokeWidth;
+          }
+          if (this.viz.box.width != null) {
+            if ((base8 = this.viz.box).left == null) {
+              base8.left = 0;
+            }
+          }
+          if (this.viz.box.height != null) {
+            if ((base9 = this.viz.box).top == null) {
+              base9.top = 0;
+            }
+          }
+          // Determine layout now if bounded (otherwise, determine later).
+          if ((this.viz.box.width != null) && this.viz.box.height && (this.viz.layout == null)) {
+            this.viz.layout = (this.viz.box.height < this.viz.box.width) ? "vertical" : "horizontal";
+          }
+          // Default strokeWidth to 0 if no stroke.
+          if (typeof this.viz.box.strokeWidth === "undefined") {
+            this.viz.box.strokeWidth = !explicit || ((this.viz.box.stroke == null) && (this.viz.box.fill != null)) ? 0 : 1;
+          }
+          if ((base10 = this.viz.box).fill == null) {
+            base10.fill = "transparent";
+          }
+          if (explicit) {
+            if ((base11 = this.viz.box).stroke == null) {
+              base11.stroke = "#80808080";
+            }
+          }
+          this._fitBoxStroke(this.viz.box);
+          if ((this.viz.box.angle != null) || (this.viz.box.originX != null) || (this.viz.box.originY != null) || (this.viz.box.scaleX != null) || (this.viz.box.scaleY != null)) {
+            Utils.assert(false, "\\viz_js 'box' properties should not include 'angle', 'originX' 'originY', 'scaleX', or 'scaleY'.");
+          }
+          if (this.viz.where.originX !== "left" || this.viz.where.originY !== "top") {
+            Utils.assert(false, "\\viz_js 'where' properties should not include 'originX' or 'originY'.");
+          }
+          // Execute \viz template() if it is a function.
+          // TODO: Deprecate? (See comment in spec.)
+          if (typeof this.viz.template === "function") {
+            // template() requires evaluation in a safe environment.
+            safeTemplate = nxCompiler.compileCode("return ((() => {let template_this = {}; let template = this.template_fn.bind(template_this)(); return {template, template_this};})())");
+            ret = safeTemplate.bind({
+              template_fn: this.viz.template
+            })(VizBlock.staticSandboxEnv);
+            this.viz.template = ret.template;
+            this.templateThis = ret.template_this;
+          }
+          // Non-safe version: @viz.template = @viz.template()
+
+          // Create the VizBlock for 'all' if replicated (scope has a range or 'all' is provided.
+          if (!fromAll && (range || this.viz.all)) {
+            this.all = new VizBlock(this.pane, src, this.viz.all, null, true);
+          }
+        }
+
+        /*
+        Adjust box to contain the stroke within its bounds, but only if this has not already been done and only if the
+        bounds (width/height) are known. This function can be called multiple times safely. box.bounded = true indicates
+        that the adjustment has been applied.
+        */
+        _fitBoxStroke(box) {
+          if (!box.bounded && (box.width != null) && (box.height != null)) {
+            // Apply minimum Rect height/width of 1.
+            if (box.height < 1) {
+              box.height = 1;
+            }
+            if (box.width < 1) {
+              box.width = 1;
+            }
+            if (box.strokeWidth) {
+              if (box.strokeWidth > box.width / 3) {
+                box.strokeWidth = box.width / 3;
+              }
+              if (box.strokeWidth > box.height / 3) {
+                box.strokeWidth = box.height / 3;
+              }
+              box.width -= box.strokeWidth;
+              box.height -= box.strokeWidth;
+            } else {
+              box.strokeWidth = 0;
+            }
+            return box.bounded = true;
+          }
+        }
+
+        invoke(fn, context, scopes) {
+          var e, global, ret, viz_fn;
+          global = this.pane.vizGlobal;
+          Object.assign(context, this.templateThis);
+          // Add VIZ specific stuff to environment.
+          // TODO: Clean up the params and viz environment.
+          viz_fn = this.exec(VizBlock.staticSandboxEnv)[fn];
+          ret = null;
+          if (typeof viz_fn === "function") {
+            context.scopes = scopes;
+            try {
+              ret = (viz_fn.bind(context))();
+            } catch (error) {
+              e = error;
+              console.log(`Error executing \\viz_js function:
+--------------
+${viz_fn.toString()}
+--------------
+   Error: ${e.message}`);
+              debugger; // To debug this VIZ error, single step, then "step into" to re-enter the failing function.
+              try {
+                // Step into the failing function so it can be debugged, hoping that its
+                // behavior is reproducible.
+                (viz_fn.bind(context))();
+              } catch (error) {
+                e = error;
+                // Expect an error, as already caught the first time.
+                null;
+              }
+            }
+            context.scopes = null; // To free the storage. (Provided for each invocation.)
+          }
+          return ret;
+        }
+
+        /*
+        Static helper for sandboxEnv that builds the sandbox env from a list of properties to extract from window.
+        @param {<String>Array} props
+        return {Object} the constructed environment
+        */
+        static windowEnv(props, window_fns) {
+          var env, j, l, len, len1, prop;
+          env = {};
+          for (j = 0, len = props.length; j < len; j++) {
+            prop = props[j];
+            if (window[prop] != null) {
+              env[prop] = window[prop];
+            } else {
+              console.log(`Warning: global ${prop} does not exist for inclusion in VIZ sandbox environment.`);
+            }
+          }
+// setTimeout, clearTimeout, setInterval, and clearInterval must be bound to window.
+          for (l = 0, len1 = window_fns.length; l < len1; l++) {
+            prop = window_fns[l];
+            if (window[prop] != null) {
+              env[prop] = window[prop].bind(window);
+            } else {
+              console.log(`Warning: global ${prop} does not exist for inclusion in VIZ sandbox environment.`);
+            }
+          }
+          return env;
+        }
+
+        /*
+        The static components of the environment for JS sandboxes in which VIZ code runs.
+        */
+        static staticSandboxEnvFn() {
+          var ref, ret;
+          // Provide JS builtins in sandboxed viz environment. Maybe there's a better way?
+          ret = this.windowEnv([
+            "Infinity",
+            "NaN",
+            "eval",
+            "isFinite",
+            "isNaN",
+            // Don't exist on Firefox: "SharedArrayBuffer", "arguments"
+            "parseFloat",
+            "parseInt",
+            "Object",
+            "Function",
+            "Boolean",
+            "Symbol",
+            "Error",
+            "EvalError",
+            "RangeError",
+            "ReferenceError",
+            "SyntaxError",
+            "TypeError",
+            "URIError",
+            "Number",
+            "BigInt",
+            "Math",
+            "Date",
+            "String",
+            "RegExp",
+            "Array",
+            "Int8Array",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "Float32Array",
+            "Float64Array",
+            "BigInt64Array",
+            "BigUint64Array",
+            "Map",
+            "Set",
+            "WeakMap",
+            "WeakSet",
+            "ArrayBuffer",
+            "Atomics",
+            "DataView",
+            "JSON",
+            "Promise",
+            "Reflect",
+            "Proxy",
+            "Intl",
+            "console",
+            "alert",
+            "atob",
+            "confirm",
+            "prompt",
+            "fabric",
+            "FontFace"
+          ], ["setInterval", "setTimeout", "clearInterval", "clearTimeout"]);
+          // Don't add document, but add document.font.
+          ret.document = {
+            fonts: (ref = window.document) != null ? ref.fonts : void 0
+          };
+          // Add a wait function for convenience.
+          ret.wait = function(delay) {
+            return new Promise(function(resolve) {
+              return setTimeout(resolve, ms);
+            });
+          };
+          return ret.window = ret;
+        }
+
+      };
+
+      // @property {VizPane} The {VizPane}.
+      VizBlock.prototype.pane = null;
+
+      // @property {function} The function from nxCompiler that takes a context argument (and should be bound to provide 'this') that
+      //                      returns the body of the \viz block as an Object.
+      VizBlock.prototype.exec = null;
+
+      // @property {Object} The body of the \viz*.
+      VizBlock.prototype.viz = null;
+
+      // @property {any} 'this' from template() to shallow-copy into 'this' for per-instance \viz functions.
+      VizBlock.prototype.templateThis = {};
+
+      // @property {VizBlock, null} The VizBlock for all.
+      VizBlock.prototype.all = null;
+
+      VizBlock.staticSandboxEnv = VizBlock.staticSandboxEnvFn();
+
+      return VizBlock;
+
+    }).call(this);
+    VizAlphaContext = (function() {
+      class VizAlphaContext {
+        constructor(methodName, cyc1, scopes1, context1, definition, global1) {
+          /*
+          Register objects to be rendered on the canvas. Available only from a render method. These objects will be
+          removed from the canvas prior to invoking corresponding unrender method.
+          @param {Array<fabric.Object>} Array of fabricJS objects.
+          */
+          //render: (objects) ->
+          //  @context.addRenderObjects(@global.canvas, objects)
+          /*
+          Add objects to the canvas (from init* methods), and make them available via getObject(..).
+          @param {Object<fabric.Objects>} Object containing fabricJS objects.
+          */
+          //initObjects: (objects) ->
+          //  @context.addInitObjects(@global.canvas, objects)
+          /*
+          Return the pipesignal {SignalValue}, specified by name and the time (in phases) of
+          the phase-zero version of the signal. SandPiper turns \viz_js-context references into
+          calls to this method.
+          @param {String} sig the full pipesignal name.
+          @param {Number} phaseOfPipestageZero the phase of the trace of the phase-zero
+                          version of the pipesignal.
+          @return {SignalValue, null} a {SignalValue} representing the signal at the requested time;
+                                      null if signal not found.
+          */
+          this.sigRef = this.sigRef.bind(this);
+          /*
+          @deprecated by sigVal(..)
+          */
+          this.svSigRef = this.svSigRef.bind(this);
+          /*
+          Return a {SignalValue}, specified by name and (phase-granular) cycle offset.
+          TODO: Currently, SandPiper does not interpret '*sv_sig_name' references to call this.
+          @param {String} the full name of the signal.
+          @param {Number} cycOffset the offset from the current cycle at which to access the signal value.
+          @return {SignalValue, null} a {SignalValue} representing the signal at the requested time;
+                                      null if signal not found.
+          */
+          this.sigVal = this.sigVal.bind(this);
+          this.methodName = methodName;
+          this.cyc = cyc1;
+          this.scopes = scopes1;
+          this.context = context1;
+          this.definition = definition;
+          this.global = global1;
+          // Cusomize for particular @methodName.
+          if (this.methodName.startsWith("render")) {
+            this.initObjects = null;
+          } else {
+            this.render = null;
+          }
+        }
+
+        getCycle() {
+          return this.cyc;
+        }
+
+        getGlobal() {
+          return this.global;
+        }
+
+        getContext() {
+          return this.context;
+        }
+
+        getDefinition() {
+          return this.definition;
+        }
+
+        getScope(name) {
+          return this.scopes[name];
+        }
+
+        getIndex(name) {
+          if (name) {
+            return this.scopes[name].index;
+          } else {
+            return this.context.index;
+          }
+        }
+
+        getCanvas() {
+          return this.global.canvas;
+        }
+
+        // These might be results for an instance or scope. TODO: Make a common base class.
+        fromInit() {
+          return this.context.initResults;
+        }
+
+        fromRender() {
+          return this.context.renderedResults;
+        }
+
+        getInitObject(name) {
+          return this.context.initObjects[name];
+        }
+
+        getInitObjects() {
+          return this.context.initObjects;
+        }
+
+        sigRef(sig, phaseOfPipestageZero) {
+          var sigName;
+          // Convert phase to cycle
+          sigName = "TLV" + sig;
+          sig = this.definition.pane.waveData.getSignalByName(sigName);
+          if (!sig) {
+            return null;
+          }
+          // TODO: sig.cycle doesn't consider B-phase.
+          return new SignalValue(sig, this.cyc - phaseOfPipestageZero / 2 + sig.cycle);
+        }
+
+        svSigRef(sig, cycOffset = 0) {
+          return this.sigVal(sig, cycOffset);
+        }
+
+        sigVal(sig, cycOffset = 0) {
+          var sigName;
+          // Convert phase to cycle
+          sigName = "SV." + sig;
+          sig = this.definition.pane.waveData.getSignalByName(sigName);
+          if (!sig) {
+            return null;
+          }
+          // TODO: sig.cycle doesn't consider B-phase.
+          return new SignalValue(sig, this.cyc + cycOffset);
+        }
+
+      };
+
+      // @property {"initEach", "renderEach", "initAll", "renderAll"}
+      //           the name of the method being invoked with this context.
+      VizAlphaContext.prototype.methodName = null;
+
+      VizAlphaContext.prototype.cyc = null;
+
+      VizAlphaContext.prototype.global = null;
+
+      // @property {VizScopeContext, VizInstanceContext} the TLV instance hierarchy context for the invocation.
+      VizAlphaContext.prototype.context = null;
+
+      VizAlphaContext.prototype.definition = null;
+
+      VizAlphaContext.prototype.scopes = null;
+
+      return VizAlphaContext;
+
+    }).call(this);
+    VizInstanceContext = (function() {
+      class VizInstanceContext {
+        /*
+        Constructor. Recursively processes user's initAll() and initEach() functions from submodel
+        and creates a fabric.Group for each instance. Recursion adds child Groups to Group.
+        initAll() functions are evaluated, and results replace the function in submodel.
+        initEach() results are placed in this class.
+        Each instance has a fabric.Group containing its children.
+        @param {VizScopeContext} scope Containing {VizScopeContext}.
+        @param {int} index Index of this instance.
+        @param {Object} submodel Submodel of @model.
+        @param {VizPane} pane The {VizPane}
+        @param {Object} scopes The {VizInstanceContext} for this and each parent scope, indexed by name
+                               (not yet updated with this instance).
+        */
+        constructor(scope1, index1, submodel, pane, scopes) {
+          var child, j, len, name, obj, objectsArray, ref, ref1, ref2;
+          this.scope = scope1;
+          this.index = index1;
+          scopes[this.scope.name] = this;
+          this.renderedObjects = [];
+          this.initObjects = {};
+          // The fabric.Group of this instance (or the canvas for top-level (and if we find an
+          // incompatibility, we'll use a Group at the top level, too)).
+          //@group = if @scope.name is "top" then pane.vizGlobal.canvas else new fabric.Group()
+          this.children = {};
+          // Process viz_alpha.
+          if (submodel.viz_alpha != null) {
+            // Evaluate initEach()
+            this.initResults = submodel.viz_alpha.invoke("initEach", pane.cyc, scopes, this);
+            // Extract Fabric objects from result.
+            if (((ref = this.initResults) != null ? ref.objects : void 0) != null) {
+              objectsArray = [];
+              ref1 = this.initResults.objects;
+              for (name in ref1) {
+                obj = ref1[name];
+                this.initObjects[name] = obj;
+                objectsArray.push(obj);
+                pane.vizGlobal.canvas.add(obj);
+              }
+            }
+          }
+          ref2 = submodel.children;
+          // Recurse, for every child scope.
+          for (j = 0, len = ref2.length; j < len; j++) {
+            child = ref2[j];
+            if (child.ident != null) {
+              // Construct a VizScopeContext
+              name = child.ident.substring(1);
+              this.children[name] = new VizScopeContext(this, name, child, pane, scopes);
+            }
+          }
+          delete scopes[this.scope.name];
+        }
+
+        /*
+        Render (make updates to) or unrender the canvas to reflect or unreflect the current cycle.
+        Set @renderResults to the return value (unless unrendering)
+        @param {Object} scopes As in constructor.
+        @param {VizPane} pane The {VizPane}.
+        @param {Boolean} un unrender if truthy.
+        */
+        render(scopes, pane, un) {
+          var child, fnName, name, ref, ref1, rslt;
+          Utils.assert(!un === (pane.renderedCyc === null));
+          scopes[this.scope.name] = this;
+          if (this.scope.modelScope.viz_alpha != null) {
+            fnName = un ? "unrenderEach" : "renderEach";
+            rslt = this.scope.modelScope.viz_alpha.invoke(fnName, pane.cyc, scopes, this);
+            if (un) {
+              // Remove rendered objects from canvas.
+              pane.vizGlobal.canvas.remove(...this.renderedObjects);
+              this.renderedObjects = [];
+            } else {
+              Utils.assert(this.renderedObjects.length === 0);
+              this.renderResults = rslt;
+              if (((ref = this.renderResults) != null ? ref.objects : void 0) != null) {
+                this.renderedObjects = this.renderResults.objects;
+                pane.vizGlobal.canvas.add(...this.renderedObjects);
+              }
+            }
+          }
+          ref1 = this.children;
+          for (name in ref1) {
+            child = ref1[name];
+            child.render(scopes, pane, un);
+          }
+          return delete scopes[this.scope.name];
+        }
+
+      };
+
+      // @property {VizScopeContext} Containing {VizScopeContext}.
+      VizInstanceContext.prototype.scope = null;
+
+      // @property {int} Index of this instance.
+      VizInstanceContext.prototype.index = null;
+
+      // @property {Object<VizScopeContext>} Child scopes. (Legacy)
+      VizInstanceContext.prototype.children = null;
+
+      // @property {Array<fabric.Object>} Array of fabric.js objects added to canvas by render(..).
+      VizInstanceContext.prototype.renderedObjects = null;
+
+      // @property {Object<fabric.Object>} Object containing fabric.js objects added to canvas by initObjects(..).
+      VizInstanceContext.prototype.initObjects = null;
+
+      // @property {Any} Results of invoking \viz_alpha initEach().
+      VizInstanceContext.prototype.initResults = void 0;
+
+      // @property {Any} Results of invoking \viz_alpha renderEach().
+      VizInstanceContext.prototype.renderResults = void 0;
+
+      return VizInstanceContext;
+
+    }).call(this);
+    VizScopeContext = (function() {
+      class VizScopeContext {
+        /*
+        Invoke \viz_alpha initAll() for this scope, then recurse into children.
+        @param {VizInstanceContext} parentInstance
+        @param {String} name The name of this scope, from @model.
+        @param {Object} modelScope the corresponding parse model.
+        @param {VizPane} pane The {VizPane}.
+        @param {Object} scopes The {VizInstanceContext} for this and each parent scope, indexed by name.
+        */
+        constructor(parentInstance, name1, modelScope, pane, scopes) {
+          var i, j, name, obj, ref, ref1, ref2, ref3;
+          this.parentInstance = parentInstance;
+          this.name = name1;
+          this.modelScope = modelScope;
+          this.instances = {};
+          this.renderedObjects = [];
+          this.initObjects = {};
+          // Evaluate user's initAll() for this scope.
+          if (this.modelScope.viz_alpha != null) {
+            this.initResults = this.modelScope.viz_alpha.invoke("initAll", pane.cyc, scopes, this);
+            if (((ref = this.initResults) != null ? ref.objects : void 0) != null) {
+              ref1 = this.initResults.objects;
+              for (name in ref1) {
+                obj = ref1[name];
+                this.initObjects[name] = obj;
+                pane.vizGlobal.canvas.add(obj);
+              }
+            }
+          }
+          // Recurse.
+          if ((this.modelScope.logicalScope.min_index != null) && (typeof this.modelScope.logicalScope.min_index === "number")) {
+            for (i = j = ref2 = this.modelScope.logicalScope.min_index, ref3 = this.modelScope.logicalScope.max_index; (ref2 <= ref3 ? j <= ref3 : j >= ref3); i = ref2 <= ref3 ? ++j : --j) {
+              this.instances[i.toString()] = new VizInstanceContext(this, i.toString(), this.modelScope, pane, scopes);
+            }
+          } else {
+            this.instances[""] = new VizInstanceContext(this, null, this.modelScope, pane, scopes);
+          }
+        }
+
+        /*
+        Invoke \viz_alpha [un]renderAll() for this scope, then recurse into instances.
+        @param {Object} scopes As in constructor.
+        @param {VizPane} pane The {VizPane}.
+        @param {Boolean} un Unrender if truthy.
+        */
+        render(scopes, pane, un) {
+          var fnName, i, inst, ref, ref1, results, rslt;
+          Utils.assert(!un === (pane.renderedCyc === null));
+          // For this scope.
+          if (this.modelScope.viz_alpha != null) {
+            fnName = un ? "unrenderAll" : "renderAll";
+            rslt = this.modelScope.viz_alpha.invoke(fnName, pane.cyc, scopes, this);
+            if (un) {
+              // Remove rendered objects from canvas.
+              pane.vizGlobal.canvas.remove(...this.renderedObjects);
+            } else {
+              this.renderResults = rslt;
+              if (((ref = this.renderResults) != null ? ref.objects : void 0) != null) {
+                this.renderedObjects = this.renderResults.objects;
+                pane.vizGlobal.canvas.add(...this.renderedObjects);
+              }
+            }
+          }
+          ref1 = this.instances;
+          // Recurse into children.
+          results = [];
+          for (i in ref1) {
+            inst = ref1[i];
+            results.push(inst.render(scopes, pane, un));
+          }
+          return results;
+        }
+
+      };
+
+      // @property {VizInstanceContext}
+      VizScopeContext.prototype.parentInstance = null;
+
+      // @property {String} The name of this scope, from @model.
+      VizScopeContext.prototype.name = null;
+
+      // @property {Object} the corresponding parse model.
+      VizScopeContext.prototype.modelScope = null;
+
+      // @property {Object<VizInstanceContext>} "array" of instances of this scope.
+      // Index is "" for non-replicated scope.
+      VizScopeContext.prototype.instances = null;
+
+      // @property {Array<fabric.Object>} Array of fabric.js objects rendered to canvas.
+      VizScopeContext.prototype.renderedObjects = null;
+
+      // @property {Object<fabric.Object>} Object containing fabric.js objects added to convas by initObjects(..).
+      VizScopeContext.prototype.initObjects = null;
+
+      // @property {Any} Results of invoking \viz_alpha initAll().
+      VizScopeContext.prototype.initResults = void 0;
+
+      // @property {Any} Results of invoking \viz_alpha renderAll().
+      VizScopeContext.prototype.renderResults = void 0;
+
+      return VizScopeContext;
+
+    }).call(this);
+    VizAlphaBlock = (function() {
+      class VizAlphaBlock {
+        /*
+        @param {String} pane The {VizPane}.
+        @param {String} src The body of the \viz* block from VizPane.model.
+        */
+        constructor(pane1, src1) {
+          this.pane = pane1;
+          this.src = src1;
+          // A default invoke method in case eval fails to define it.
+          this.invoke = function() {
+            return void 0;
+          };
+          this.exec = nxCompiler.compileCode(`return {${this.src}}`);
+          this.invoke = (fn, cyc, scopes, instance) => { // TODO: Why is this declared in the constructor?
+            var context, e, global, top, viz;
+            context = new VizAlphaContext(fn, cyc, scopes, instance, this, this.pane.vizGlobal);
+            global = this.pane.vizGlobal;
+            // Add VIZ specific stuff to environment.
+            // TODO: Clean up the params and viz environment.
+            top = Object.assign(VizAlphaBlock.staticSandboxEnv, {
+              fn,
+              cyc,
+              scopes,
+              instance,
+              this: this,
+              VizAlphaContext,
+              fabric,
+              sigRef: this.sigRef,
+              global,
+              context
+            });
+            // Provide access to top-level context as an object (TODO: rename to 'this' or 'context'
+            // when these are eliminated) as an object that can be passed around.
+            top.top = top;
+            viz = this.exec(top); // TODO: It shouldn't be necessary to evaluate this each time. Returned property values should not be context-sensitive.
+            if (typeof viz[fn] === "function") {
+              try {
+                return (viz[fn].bind(context))();
+              } catch (error) {
+                e = error;
+                console.log(`Error executing the function: ${fn}()
+   from \\viz* script:
+--------------
+${this.src}
+--------------
+   Error: ${e.message}`);
+                debugger;
+                try {
+                  // Step into the failing function so it can be debugged, hoping that its
+                  // behavior is reproducible.
+                  (viz[fn].bind(context))();
+                } catch (error) {
+                  e = error;
+                  // Expect an error, as already caught the first time.
+                  null;
+                }
+                return null;
+              }
+            }
+          };
+        }
+
+        /*
+        Static helper for sandboxEnv that builds the sandbox env from a list of properties to extract from window.
+        @param {<String>Array} props
+        return {Object} the constructed environment
+        */
+        static windowEnv(props, window_fns) {
+          var env, j, l, len, len1, prop;
+          env = {};
+          for (j = 0, len = props.length; j < len; j++) {
+            prop = props[j];
+            if (window[prop] != null) {
+              env[prop] = window[prop];
+            } else {
+              console.log(`Warning: global ${prop} does not exist for inclusion in VIZ sandbox environment.`);
+            }
+          }
+// setTimeout, clearTimeout, setInterval, and clearInterval must be bound to window.
+          for (l = 0, len1 = window_fns.length; l < len1; l++) {
+            prop = window_fns[l];
+            if (window[prop] != null) {
+              env[prop] = window[prop].bind(window);
+            } else {
+              console.log(`Warning: global ${prop} does not exist for inclusion in VIZ sandbox environment.`);
+            }
+          }
+          return env;
+        }
+
+        /*
+        The static components of the environment for JS sandboxes in which VIZ code runs.
+        */
+        static staticSandboxEnvFn() {
+          // Provide JS builtins in sandboxed viz environment. Maybe there's a better way?
+          return this.windowEnv([
+            "Infinity",
+            "NaN",
+            "eval",
+            "isFinite",
+            "isNaN",
+            // Don't exist on Firefox: "SharedArrayBuffer", "arguments"
+            "parseFloat",
+            "parseInt",
+            "Object",
+            "Function",
+            "Boolean",
+            "Symbol",
+            "Error",
+            "EvalError",
+            "RangeError",
+            "ReferenceError",
+            "SyntaxError",
+            "TypeError",
+            "URIError",
+            "Number",
+            "BigInt",
+            "Math",
+            "Date",
+            "String",
+            "RegExp",
+            "Array",
+            "Int8Array",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int16Array",
+            "Uint16Array",
+            "Int32Array",
+            "Uint32Array",
+            "Float32Array",
+            "Float64Array",
+            "BigInt64Array",
+            "BigUint64Array",
+            "Map",
+            "Set",
+            "WeakMap",
+            "WeakSet",
+            "ArrayBuffer",
+            "Atomics",
+            "DataView",
+            "JSON",
+            "Promise",
+            "Reflect",
+            "Proxy",
+            "Intl",
+            "console",
+            "alert",
+            "atob",
+            "confirm",
+            "prompt"
+          ], ["setInterval", "setTimeout", "clearInterval", "clearTimeout"]);
+        }
+
+      };
+
+      // @property {VizPane} The {VizPane}.
+      VizAlphaBlock.prototype.pane = null;
+
+      // @property {String} The body of the \viz*.
+      VizAlphaBlock.prototype.src = null;
+
+      // @property {function} Invokes a \viz* method in appropriate context. (See constructor.)
+      VizAlphaBlock.prototype.invoke = null;
+
+      VizAlphaBlock.staticSandboxEnv = VizAlphaBlock.staticSandboxEnvFn();
+
+      return VizAlphaBlock;
+
+    }).call(this);
+    Utils.extend(VizPane, Pane.Steppable);
+    Utils.extend(VizPane, Pane.Scalable);
+    Utils.extend(VizPane, module.config(), true, true);
+    Utils.extend(VizPane, ModelViewSync);
+    return VizPane;
+  });
+
+}).call(this);

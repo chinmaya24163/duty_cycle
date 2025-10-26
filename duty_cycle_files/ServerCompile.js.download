@@ -1,0 +1,678 @@
+(function() {
+
+  /*
+  Compilation results.
+  Compilation is initiated by the client. When kicked off by the server, the server sends back a compilation ID,
+  and an instance of this class is created, indexed in ServerCompile.compilations by the ID.
+  */
+  /*
+  The replacement {ServerCompile} to be used once `results-cache` and `project-compiler` are fully implemented.
+  Abandoned.
+  */
+  /*
+  The original {ServerCompile} module, before the `results-cache` rewrite.  Depreciated, planned to be removed when
+  `results-cache` and `project-compiler` have been finished.
+
+  @extend ModuleConfigObject
+  @extend EventEmitter
+  */
+  /*
+  A module that uses the SandHost server to compile TL-Verilog and produces output.
+
+  @abstract
+  @extend EventEmitter
+  @todo +outline Document emitted events.
+  @todo +outline Test the entire file.
+  */
+  var $, Compilation, EventEmitter, NewServerCompile, Promise, RetroServerCompile, ServerCompile, ServerCompileWrapper, WaveData, io,
+    boundMethodCheck = function(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new Error('Bound instance method accessed before binding'); } };
+
+  [$, Promise, io, WaveData] = [];
+
+  if ((typeof module !== "undefined" && module !== null ? module.exports : void 0) != null) {
+    Promise = require("bluebird");
+    io = require("socket.io-client");
+  }
+
+  ServerCompile = (function() {
+    class ServerCompile {
+      /*
+      @return {Promise<ServerCompile>}
+      @abstract
+      */
+      init() {
+        throw new Error("Unimplemented method.");
+      }
+
+      /*
+      Sends TL-Verilog to the server to compile.
+      @param {String} tlv the source code to compile
+      @param {Function} cb called with no arguments after the compilation starts executing remotely.
+      */
+      compile(tlv, cb) {
+        throw new Error("Unimplemented method.");
+      }
+
+      /*
+      Opens a window to display the statistics page.
+      */
+      showStats() {
+        throw new Error("Unimplemented method.");
+      }
+
+      /*
+      Opens a window to display the statistics page.
+      */
+      showResults() {
+        throw new Error("Unimplemented method.");
+      }
+
+      /*
+      Sends the number of compilations to Google Analytics.
+      */
+      compileAnalytics() {
+        if (typeof window.ga !== "function") {
+          return;
+        }
+        return window.ga("send", {
+          hitType: "event",
+          eventCategory: "Projects",
+          eventAction: "compile",
+          eventValue: ++this.sentCompilations
+        });
+      }
+
+    };
+
+    // @property {Number} The number of compilations started
+    ServerCompile.prototype.sentCompilations = 0;
+
+    // @property {Object} The app configuration.
+    ServerCompile.prototype.config = null;
+
+    return ServerCompile;
+
+  }).call(this);
+
+  RetroServerCompile = (function() {
+    class RetroServerCompile extends ServerCompile {
+      constructor() {
+        super(...arguments);
+        /*
+        Handles error responses from the server.
+        @param {String} id the compilation ID associated with this run
+        @param {String} type the stage that experienced an error
+        */
+        this.error = this.error.bind(this);
+        /*
+        Handles graph responses from the server.
+        @param {String} id the compilation ID associated with this run
+        @param {String} graph the resulting graph
+        */
+        this.graph = this.graph.bind(this);
+        /*
+        Handles JSON Parse Model responses from the server.
+        @param {String} id the compilation ID associated with this run
+        @param {String} json the resulting JSON
+        */
+        this.jsonParseModel = this.jsonParseModel.bind(this);
+        /*
+        Handles vcd responses from the server.
+        @param {String} id the compilation ID associated with this run
+        @param {String} vcd the resulting VCD file
+        */
+        this.vcd = this.vcd.bind(this);
+        /*
+        Handles navTLV responses from the server.
+        @param {String} id the compilation ID associated with this run
+        @param {String} navTLV the resulting HTML representation of the TLV code.
+        */
+        this.navTLV = this.navTLV.bind(this);
+      }
+
+      init(config1) {
+        this.config = config1;
+        // Effectively disable EventEmitter listener return value used to trigger just once.
+        this.setOnceReturnValue({});
+        this.io();
+        return Promise.resolve(this);
+      }
+
+      // When simulation is disabled, we need to emit events for the non-generation of VCD,
+      // So listen to the project events, and echo them as compiler events.
+      setProject(project) {
+        this.project = project;
+        this.project.on("locked vcd", (wd) => {
+          return this.emit("vcd", {
+            locked: true,
+            wd
+          });
+        });
+        // Track whether the VCD is locked to filter VCD events from simulation.
+        return this.project.on("simulation-enabled", (enabled) => {
+          this.simulationEnabled = enabled;
+          return this.emit("simulation-enabled", enabled);
+        });
+      }
+
+      compile(tlv, cb) {
+        var data, dot, sim;
+        this.compileAnalytics();
+        // Do both sim and dot diagram generation
+        // if not in "debug mode".
+        sim = true;
+        dot = true;
+        // Disable the simulation step in "debug mode".
+        // (A pre-uploaded waveform is already present).
+        if (this.project != null) {
+          sim = !this.project.vcd;
+        }
+        data = {
+          source: tlv,
+          sim: sim,
+          dot: dot
+        };
+        return this.socket.emit("data", JSON.stringify(data), (lastId) => {
+          this.lastId = lastId;
+          return cb(this.lastId);
+        });
+      }
+
+      showStats() {
+        return window.open(window.appApiUrl(`/compile/${this.lastNavTLV}/stats/`));
+      }
+
+      showResults() {
+        return window.open(window.appApiUrl(`/compile/${this.lastNavTLV}/results/`));
+      }
+
+      /*
+      Configures Socket.io.
+      @return {IO:Socket}
+      @private
+      */
+      io() {
+        var socketOpts;
+        socketOpts = {
+          path: window.appApiUrl("/socket.io")
+        };
+        // Specifically for nanoHUB.
+        // nanoHUB's proxy doesn't like persistent connections.
+        if (this.config.configID === "nanoHUB_user") {
+          socketOpts.transports = ['websocket'];
+        }
+        this.socket = io("/sandpiper/compile/", socketOpts);
+        this.socket.on("newcompile", (data) => {
+          var compilation;
+          // Record this compilation.
+          this.compilations = {}; // Free previous compilations.
+          compilation = new Compilation(data);
+          this.compilations[data.id] = compilation;
+          data.compilation = compilation;
+          this.emit("newcompile", data);
+          return this.emit("m4/done", {
+            compile: data.id,
+            compilation
+          });
+        });
+        this.socket.on("err", this.error);
+        this.socket.on("graph", this.graph);
+        this.socket.on("parse model", this.jsonParseModel);
+        this.socket.on("vcd", this.vcd);
+        this.socket.on("navTLV", this.navTLV);
+        this.socket.on("stdall", (id, log) => {
+          if (id !== this.lastId) {
+            return;
+          }
+          return this.emit("stdall/all", log);
+        });
+        this.socket.on("makeout", (id, log) => {
+          if (id !== this.lastId) {
+            return;
+          }
+          return this.emit("makeout/all", log);
+        });
+        return this.socket;
+      }
+
+      error(type, id) {
+        boundMethodCheck(this, RetroServerCompile);
+        if (id !== this.lastId) {
+          return;
+        }
+        switch (type) {
+          case "graph":
+            return this.emit("graphviz/done", {
+              success: "failure"
+            });
+          case "graph-timeout":
+            return this.emit("graphviz/done", {
+              success: "failure",
+              timeout: true
+            });
+          case "vcd":
+            return this.emit("verilator/done", {
+              success: "failure",
+              id
+            });
+          case "vcd-timeout":
+            return this.emit("verilator/done", {
+              success: "failure",
+              timeout: true,
+              id
+            });
+          case "compile":
+            return this.emit("sandpiper/done", {
+              success: "failure"
+            });
+          case "compile-timeout":
+            return this.emit("sandpiper/done", {
+              success: "failure",
+              timeout: true
+            });
+          case "navtlv":
+            return this.emit("navtlv/done", {
+              success: "failure"
+            });
+          case "navtlv-timeout":
+            return this.emit("navtlv/done", {
+              success: "failure",
+              timeout: true
+            });
+        }
+      }
+
+      graph(id, graph) {
+        boundMethodCheck(this, RetroServerCompile);
+        //console.log "Got graph (response: #{id}, stored id: #{@lastId})"
+        if (id !== this.lastId) {
+          return;
+        }
+        if (graph === "") {
+          // Sometimes the server responds with success and returns an empty graph.
+          // TODO: It might be better to address this on the server.
+          // TODO: This fix was applied to this "retro" method without fixing the new method.
+          // It's not necessary to emit graph; I added this line back in because tests were failing.
+          this.emit("graph", graph);
+          return this.emit("graphviz/done", {
+            success: "failure"
+          });
+        } else {
+          this.emit("graph", graph);
+          return this.emit("graphviz/done", {
+            success: "success"
+          });
+        }
+      }
+
+      jsonParseModel(id, json) {
+        boundMethodCheck(this, RetroServerCompile);
+        if (id !== this.lastId) {
+          return;
+        }
+        this.emit("parse model", {
+          model: JSON.parse(json, id)
+        });
+        return this.emit("parse model/done", {
+          success: "success",
+          id
+        });
+      }
+
+      vcd(id, vcd) {
+        boundMethodCheck(this, RetroServerCompile);
+        if (id !== this.lastId || !this.simulationEnabled) {
+          return;
+        }
+        this.emit("vcd", {
+          locked: false,
+          wd: new WaveData(vcd, true),
+          id
+        });
+        return this.emit("verilator/done", {
+          success: "success",
+          id
+        });
+      }
+
+      navTLV(id, navTLV) {
+        boundMethodCheck(this, RetroServerCompile);
+        if (id !== this.lastId) {
+          return;
+        }
+        this.lastNavTLV = id;
+        this.emit("sandpiper/done", {
+          success: "success",
+          id
+        });
+        return this.emit("navTLV", navTLV);
+      }
+
+    };
+
+    // @property {Object} Application configuration object.
+    RetroServerCompile.prototype.config = null;
+
+    
+    // @property {IO:Socket} A connection to the compilation server
+    RetroServerCompile.prototype.socket = null;
+
+    // @property {String} An ID of the the last compilation
+    RetroServerCompile.prototype.lastId = null;
+
+    // @property {String} An ID of the last successful navTLV compile
+    RetroServerCompile.prototype.lastNavTLV = null;
+
+    // @property {Project} Associated project to determine which steps to execute.
+    RetroServerCompile.prototype.project = null;
+
+    // @property {Object<Compilation>} Compilations, indexed by ID.
+    // Current policy is to keep only the latest.
+    RetroServerCompile.prototype.compilations = {};
+
+    // @property {Boolean} Whether the VCD is locked to filter VCD events from simulation.
+    RetroServerCompile.prototype.simulationEnabled = true;
+
+    return RetroServerCompile;
+
+  }).call(this);
+
+  NewServerCompile = (function() {
+    class NewServerCompile extends ServerCompile {
+      constructor() {
+        super(...arguments);
+        /*
+        Get the result file from a compile run.
+        */
+        this.get = this.get.bind(this);
+      }
+
+      init(config1) {
+        this.config = config1;
+        // Effectively disable EventEmitter listener return value used to trigger just once.
+        this.setOnceReturnValue({});
+        return Promise.resolve(this.getEndpoint()).then((endpoint) => {
+          return this.endpoint = endpoint;
+        }).then(() => {
+          return this.subscribe();
+        });
+      }
+
+      /*
+      Determines the URL to use when connecting to a {ResultsCache} server over HTTP.
+      @return {Promise<String>} the URL to use to connect to {ResultsCache}
+      */
+      getEndpoint() {
+        return $.get(window.appApiUrl("/results-endpoint/"));
+      }
+
+      /*
+      Provides a Socket.io connection to a {ResultsCache} server.
+      @return {Socket.io} a Socket.io client connection
+      */
+      openSocket() {
+        return io(this.endpoint);
+      }
+
+      /*
+      Subscribe to the Socket.io connection from the results cache.
+      @private
+      @todo +outline Rethink stats (do we need 'generated' and 'output' to trigger 'statsCompile'?)
+      @todo +later Implement `socket.on 'top.tlv/model'`
+      @todo +later Implement `socket.on 'top.tlv/scrubbed'`
+      @todo +later Implement `socket.on 'top.tlv/source'`
+      @todo +local_compile Finish implementing `socket.on 'log/{stage}'`
+      */
+      subscribe() {
+        var gotStats, i, len, ref, stage;
+        this.socket = this.openSocket();
+        gotStats = (data) => {
+          if (data.compile !== this.currentCompile) {
+            return;
+          }
+          return this.statCompile = data.compile;
+        };
+        ref = ["m4", "sandpiper-graph", "graphviz", "sandpiper", "verilator"];
+        for (i = 0, len = ref.length; i < len; i++) {
+          stage = ref[i];
+          this.socket.on(`${stage}/done`, (data) => {
+            if (data.compile !== this.currentCompile) {
+              return;
+            }
+            return this.emit(`${data.stage}/done`, data);
+          });
+        }
+        this.socket.on("top.tlv/generated", gotStats);
+        this.socket.on("top.tlv/output", gotStats);
+        this.socket.on("top.tlv/stats", gotStats);
+        this.socket.on("vcd", (data) => {
+          if (data.compile !== this.currentCompile) {
+            return;
+          }
+          return this.get(window.appApiUrl(`/compile/${data.compile}/simulation.vcd`)).then((vcd) => {
+            if (this.simulationEnabled) {
+              return this.emit("vcd", {
+                locked: false,
+                wd: new WaveData(vcd, true)
+              });
+            }
+          });
+        });
+        this.socket.on("top.tlv/graph", (data) => {
+          if (data.compile !== this.currentCompile) {
+            return;
+          }
+          return this.get(window.appApiUrl(`/compile/${data.compile}/top.tlv/graph.svg`)).then((graph) => {
+            return this.emit("graph", graph);
+          });
+        });
+        this.socket.on("top.tlv/nav", (data) => {
+          if (data.compile !== this.currentCompile) {
+            return;
+          }
+          return this.get(window.appApiUrl(`/compile/${data.compile}/top.tlv/navigable.tlv.html`)).then((nav) => {
+            return this.emit("navTLV", nav);
+          });
+        });
+        this.socket.on("log/sandpiper", (data) => {
+          if (data.compile !== this.currentCompile) {
+            return;
+          }
+          return this.emit("stdall", data);
+        });
+        this.socket.on("log/verilator", (data) => {
+          if (data.compile !== this.currentCompile) {
+            return;
+          }
+          return this.emit("makeout", data);
+        });
+        return this;
+      }
+
+      get(url) {
+        var base;
+        boundMethodCheck(this, NewServerCompile);
+        base = this.endpoint.replace(/\/$/, '');
+        return Promise.resolve($.get(`${base}${url}`));
+      }
+
+      /*
+      @todo Add proper metadata, etc.
+      @todo Parameterize `/makerchip/compile/`?
+      @todo Finish creating multipart/form-data, or switch directly to {CompileProject}
+      @todo Switch to using {CompileProject}
+      @todo parse output (set `currentCompile`, etc.)  Also emit `newcompile` event?
+      @todo Switch to Promise response?
+      @todo Test compilation sending
+      */
+      compile(tlv, cb) {
+        var project;
+        this.compileAnalytics();
+        project = {
+          files: {
+            "top.tlv": {
+              type: "file",
+              contents: tlv
+            }
+          },
+          metadata: {},
+          settings: {}
+        };
+        return $.post(window.appApiUrl("/makerchip/compile/"), project).then(function(data) {
+          return cb(null, data);
+        }).catch(function(err) {
+          return cb(err);
+        });
+      }
+
+      /*
+      @throws {ServerCompile.NoSuccessfulCompile} if there haven't been any compilations that generated statistics.
+      @todo handle error case
+      */
+      showStats() {
+        if (!this.statCompile) {
+          throw new ServerCompile.NoSuccessfulCompile("No successful compile yet.");
+        }
+        return window.open(`${this.endpoint}/compile/${this.successfulCompile}/top.tlv/stats/`);
+      }
+
+      /*
+      @throws {ServerCompile.NoSuccessfulCompile} if there haven't been any compilations that generated statistics.
+      @todo handle error case
+      */
+      showResults() {
+        if (!this.statCompile) {
+          throw new ServerCompile.NoSuccessfulCompile("No successful compile yet.");
+        }
+        return window.open(`${this.endpoint}/compile/${this.successfulCompile}/top.tlv/`);
+      }
+
+    };
+
+    /*
+    @property {String} a URL referring to a `results-cache` instance to fetch results from.
+    */
+    NewServerCompile.prototype.endpoint = "http://makerchip.com/results/";
+
+    /*
+    @property {IO:Socket} A connection to the compilation server
+    */
+    NewServerCompile.prototype.socket = null;
+
+    /*
+    @property {String} the ID of the last triggered compilation.
+    */
+    NewServerCompile.prototype.currentCompile = null;
+
+    /*
+    @property {String} the ID of the last compile that generated statistics.
+    */
+    NewServerCompile.prototype.statCompile = null;
+
+    return NewServerCompile;
+
+  }).call(this);
+
+  /*
+  Temporary wrapper that determines if {RetroServerCompile} or {NewServerCompile} should be used.
+  To be removed once {RetroServerCompile} is no longer needed.
+  */
+  ServerCompileWrapper = class ServerCompileWrapper extends ServerCompile {
+    init(config) {
+      return Promise.resolve(this.getEndpoint()).then((endpoint) => {
+        var implementation;
+        implementation = endpoint === "RETRO" ? RetroServerCompile : NewServerCompile;
+        this.instance = new implementation();
+        this.on = this.instance.on;
+        this.emit = this.instance.emit;
+        this.compile = () => {
+          return this.instance.compile(...arguments);
+        };
+        return this.instance.init(config);
+      });
+    }
+
+    /*
+    Determines the URL to use when connecting to a {ResultsCache} server over HTTP.
+    @return {Promise<String>} the URL to use to connect to {ResultsCache}
+    */
+    getEndpoint() {
+      return $.get(window.appApiUrl("/results-endpoint/"));
+    }
+
+  };
+
+  Compilation = (function() {
+    var id, parseModel, sim, status;
+
+    class Compilation {
+      constructor({
+          id: id1,
+          sim: sim1
+        }) {
+        this.id = id1;
+        this.sim = sim1;
+        this.status = {
+          parseModel: null,
+          graph: null,
+          vcd: null
+        };
+      }
+
+    };
+
+    // @property {String} The ID of the compilation.
+    id = null;
+
+    // @property {Boolean, null} Whether simulation was enabled.
+    sim = null;
+
+    // @property {Object, null} The parse model.
+    parseModel = null;
+
+    // @property {Object, null} The graph.
+    //graph = null
+
+    // @property {Object, null} The VCD WaveData.
+    //wd = null
+
+    // @property {Object} Status of the compilation.
+    //    parseModel: "success" | "failure" | "timeout"
+    //    graph: "success" | "failure" | "timeout"
+    //    vcd: "success" | "failure" | "timeout"
+    status = null;
+
+    return Compilation;
+
+  }).call(this);
+
+  if ((typeof module !== "undefined" && module !== null ? module.exports : void 0) != null) {
+    EventEmitter = require("events");
+    ServerCompile.prototype = Object.assign(Object.create(EventEmitter.prototype), ServerCompile.prototype);
+    NewServerCompile.prototype = Object.assign(Object.create(ServerCompile.prototype), NewServerCompile.prototype);
+    RetroServerCompile.prototype = Object.assign(Object.create(ServerCompile.prototype), RetroServerCompile.prototype);
+    ServerCompileWrapper.prototype = Object.assign(Object.create(ServerCompile.prototype), ServerCompileWrapper.prototype);
+    module.exports = {ServerCompile, RetroServerCompile, NewServerCompile, ServerCompileWrapper};
+  } else {
+    define("ServerCompile", function(require, exports, module) {
+      var Utils;
+      $ = require("jquery");
+      Utils = require("Utils");
+      Promise = require("bluebird");
+      io = require("socket.io");
+      EventEmitter = require("eventemitter");
+      WaveData = require("VCD");
+      //$.extend ServerCompile::, EventEmitter::, module.config()
+      //NewServerCompile:: = $.extend {}, Object.create(ServerCompile::), NewServerCompile::
+      //RetroServerCompile:: = $.extend {}, Object.create(ServerCompile::), RetroServerCompile::
+      //ServerCompileWrapper:: = $.extend {}, Object.create(ServerCompile::), ServerCompileWrapper::
+      Utils.extend(ServerCompile, module.config());
+      Utils.extend(ServerCompile, EventEmitter.prototype);
+      Utils.extend(NewServerCompile, Object.create(ServerCompile.prototype), true);
+      Utils.extend(RetroServerCompile, Object.create(ServerCompile.prototype), true);
+      Utils.extend(ServerCompileWrapper, Object.create(ServerCompile.prototype), true);
+      return ServerCompileWrapper;
+    });
+  }
+
+}).call(this);

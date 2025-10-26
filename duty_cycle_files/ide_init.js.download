@@ -1,0 +1,106 @@
+// Common JavaScript functions for the IDE (and apps that use the Base URL mechanism)
+// This establishes the context for the IDE and its component by:
+//    1. Configuring requirejs
+//    2. Setting up the base URL for the IDE and its components (e.g. "/sandbox")
+//    3. Loading app configuration data
+// It is to be included as a script tag by any page using IDE components.
+
+// Sets up the application context by assigning a few properties of window:
+//   - window.BASE_API_URL(root): the base path preceding the web application (e.g. "/sandbox")
+//   - window.appApiUrl(path): a function that prepends the base path
+// (The legacy function name suggests a more limited role.)
+// root: the root of the web application, e.g. "/sandbox";
+//       the application is mounted at this file's path up to this text;
+//       use "" to mount at the root.
+// Application pages should, e.g. set_BASE_API_URL("/sandbox")
+// TODO: Transition to using serverPathname as root. This is compatible, but
+//       modify this funtion to be more strict.
+var set_BASE_API_URL = function(root) {
+  var basePath = "";
+  if (window.BASE_API_URL) {
+    // Hack for new React-based development.
+    basePath = window.BASE_API_URL;
+  } else if (root === "") {
+    // basePath = "";
+  } else {
+    // This page is ".../<root>/"."
+    // Extract the base path.
+    let pathname = window.location.pathname;
+    let ind = pathname.lastIndexOf(root);
+    if (ind >= 0) {
+      basePath = pathname.slice(0, ind);
+    } else {
+      console.warn("Unable to determine base path of #{pathname}. Assuming no path.");
+    }
+  }
+  //console.log("Base API: #{basePath}");
+  window.BASE_API_URL = basePath;
+  window.appApiUrl = function(path) {
+    return basePath + path;
+  }
+};
+
+// Should be called by top-level Blade files to set up the application context.
+// Args:
+//   serverPathname: the path seen for the page by the server router (e.g. "/sandbox/")
+//   configJSON: a JSON string with the app configuration object passed via Blade
+//   userID: the user ID, or "" for none
+//   projectID: the project ID, or "" for none
+//   cb: callback function to call after the app is initialized
+// Sets:
+//   window.serverPathname: the path seen for the page by the server router (e.g. "/sandbox/")
+//   window.appConfig: the app configuration object
+//   window.userID: the user ID, or null for none
+//   window.projectID: the project ID, or null for none
+var appInit = function(serverPathname, configJSON, userID, projectID, cb) {
+  window.serverPathname = serverPathname;
+  window.appConfig = JSON.parse(configJSON);
+  set_BASE_API_URL(serverPathname);
+  
+  // Set userID and projectID.
+  // Blade works with strings, so null is passed as "".
+  window.userID = userID === "" ? null : userID;
+  window.projectID = projectID === "" ? null : projectID;
+  
+  // Configure requirejs, do global requires, and start the app.
+  requirejs.config(IDERequireConfig());
+  require([`${window.BASE_API_URL}/modules/ModuleConfig.js`], function(ModuleConfig) {
+    new ModuleConfig(window.BASE_API_URL, cb);
+  });
+}
+
+// To initialize requirejs, code should, e.g.:
+//   require.config(IDERequireConfig());
+var IDERequireConfig = function() {
+  basePath = window.BASE_API_URL;
+  return {
+    waitSeconds: 0,  // Prevent RequireJS from timing out.
+    shim: {
+      "jquery.ui": {deps: ["jquery"], exports: "jquery"},  // Exports needed??
+      "jquery.layout":  {deps: ["jquery.ui"], exports: "jquery"}  // Exports needed??
+    },
+    paths: {
+      'blade': basePath+'/blade/blade',
+      'socket.io': basePath+'/socket.io/socket.io',
+      // Local hacked permissively open-sourced packages.
+      // TODO: Need to capture the licenses for distribution.
+      "jquery.layout": basePath+"/module/FlexSplit/jquery.layout/jquery.layout",
+      'eventemitter': basePath+'/module/IDE/lib/EventEmitter.min',
+
+    },
+    // Setting up @nx-js/compiler-util copy to be required.
+    // (See notes in viz-pane/public/@nx-js/README-SFH.md)
+    packages: [
+      {
+        name: "@nx-js/compiler-util-hack",
+        location: `${basePath}/module/VizPane/@nx-js/compiler-util`,
+        main: "dist/cjs.es5.js"
+      },
+      {
+        name: "codemirror",
+        location: `${basePath}/module/Editor/codemirror`,
+        main: "lib/codemirror"
+      }
+    ]
+  };
+};

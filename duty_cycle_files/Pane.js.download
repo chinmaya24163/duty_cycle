@@ -1,0 +1,1078 @@
+(function() {
+  define("Pane", function(require, exports, module) {
+    /*
+    A Pane in the makerchip IDE.
+    This adds platform awareness to PaneComponent.
+    */
+    /*
+    A {BladeComponent} for the contents of a pane within TabbedView
+
+    @extend BladeComponent
+    */
+    var $, BladeComponent, Logging, Pane, PaneComponent, PanelLabel, Promise, ScrollWrapper, TabbedView, Utils, interact, livestamp, moment;
+    Logging = require("Logging");
+    BladeComponent = require("BladeComponent");
+    TabbedView = require("TabbedView");
+    $ = require("jquery");
+    Utils = require("Utils");
+    Promise = require("bluebird");
+    PanelLabel = require("PanelLabel");
+    moment = require("moment");
+    require("livestamp");
+    livestamp = $.fn.livestamp;
+    interact = require("interact"); // For Pane.Scalable
+    ScrollWrapper = require("ScrollWrapper");
+    PaneComponent = (function() {
+      class PaneComponent {
+        /*
+        To be overridden to provide model initialization within @initPane().
+        */
+        modelInit() {}
+
+        /*
+        Create an uninitialized tab element (inactive, null tabstatus), set @tabEl and return it,
+        without adding it to the DOM.
+        @return {jQuery} tabElement
+        */
+        _createTabElement() {
+          var closableAttr, closeEl;
+          // Tab with label.
+          closableAttr = this.closable ? " mc-pane-tab-closable" : "";
+          this.tabEl = $(`<a href=\"#\" data-tabbedview-ref=\"${this.mnemonic}\" ` + `class=\"nav-item nav-link mc-pane-tab${closableAttr}\">${this.mnemonic}</a>`);
+          // Append close button.
+          if (this.closable) {
+            closeEl = $("<i class=\"fa fa-fw fa-times mc-pane-tab-close\"></i>").click((e) => {
+              e.stopPropagation();
+              return this.close();
+            });
+            this.tabEl.append(closeEl);
+          }
+          // Prepend status placeholder element.
+          this._tabStatusEl = $(this._newStatusNode("none"));
+          this.tabEl.prepend(this._tabStatusEl);
+          // Click to activate.
+          return this.tabEl.click((e) => {
+            return this.activate();
+          });
+        }
+
+        /*
+        Initialize and render the Pane.
+        @param {String} bladeName the name of the corresponding blade file (no path or extension).
+        @param {String} mnemonic a unique name for this Pane, used as tab text as well as unique identifier.
+                        (TODO: Can use 'name', but I was worried about conflict w/ base classes.  I think it's ok.)
+        @param {TabbedView, jQuery, null} tabbedview or jQuery element into which to open this {Pane} or
+                                          null to not open immediately.
+        @param {Object} options (optional) options passed to blade compile.
+        @return {Promise<@>} @initPromise (resolving to @).
+        */
+        initPane(bladeName, mnemonic, tabbedview, options = {}) {
+          var ref;
+          this.bladeName = bladeName;
+          this.mnemonic = mnemonic;
+          this.seqID = TabbedView.paneID++;
+          TabbedView.allPanes[this.mnemonic] = this;
+          this.path = `pane-${this.seqID}-${this.bladeName}`;
+          if (options.closable != null) {
+            this.closable = options.closable;
+          }
+          // Call init methods of Pane mixins if applied.
+          //@scalableInit() if @scalable
+          //@steppableInit() if @steppable
+
+          // Render HTML.
+          this.tabPath = "";
+          options["baseApi"] = (ref = window.BASE_API_URL) != null ? ref : "..";
+          options["path"] = this.path;
+          if (options.mnemonic == null) {
+            options.mnemonic = this.mnemonic;
+          }
+          options["scalable"] = this.scalable; // Not actually used.
+          options["steppable"] = this.steppable; // Not actually used.
+          if (options.contentType == null) {
+            this.initPromise = this.compileComponent(this.bladeName, options);
+          } else if (options.contentType === "iframe") {
+            this.initPromise = Promise.resolve(`<iframe src=\"${options.contentUrl}\" width=\"100%\" height=\"100%\" class=\"mc-dragover\"></iframe>`);
+          } else if (options.contentType === "pdf") {
+            this.initPromise = Promise.resolve(this.pdfHtml(options));
+          } else {
+            Utils.assert(false, `Unknown content type: ${options.contentType}`);
+          }
+          this.initPromise = this.initPromise.then((html) => {
+            var ret;
+            ret = this; // The return value, either @ or a Promise<@> to chain.
+            this.paneEl = $(`<div class="mc-TabbedView-pane" id="${this.path}" data-pane-type="${this.bladeName}" data-tabbedview-active="false">${html}</div>"          `);
+            if (this.scalable) {
+              this.scalableInitDOM();
+            }
+            if (this.steppable) {
+              ret = this.steppableInitDOM(options);
+            }
+            // Create tab
+            this.tabEl = this._createTabElement();
+            return ret;
+          }).catch(function(err) {
+            return console.log(err);
+          });
+          // Open pane in TabbedView or simply add to DOM if requested.
+          if (tabbedview != null) {
+            return this.open(tabbedview);
+          } else {
+            return this.initPromise;
+          }
+        }
+
+        /*
+        Open this pane (as an action of the {Promise} of init(), so only after initialization).
+        @param {TabbedView, jQuery} tabbedview or jQuery element into which to open this {Pane}
+        @return {Promise<Pane>} The promise.
+        */
+        open(tabbedview1) {
+          this.tabbedview = tabbedview1;
+          this.opened = "pending";
+          return this.initPromise.then((thisPane) => {
+            if (this.tabbedview instanceof TabbedView) {
+              this.tabbedview.append(this);
+            } else {
+              // Just add to DOM (as active).
+              this.active = true;
+              this.tabbedview.append(this.paneEl);
+            }
+            this.opened = true;
+            return this.initOpened();
+          });
+        }
+
+        /*
+        Initialize the pane once added to the DOM.
+        @return {Promise}
+        */
+        initOpened() {
+          return Promise.resolve(this);
+        }
+
+        /*
+        Resize callback. Called when pane is activated or resized when active.
+        */
+        resize() {
+          if (this.steppable) {
+            return this.updateBubble();
+          }
+        }
+
+        /*
+        Enable a timestamp on this pane.  Call this under initPane(..).then =>.
+        */
+        enableTimestamp() {
+          var now;
+          now = new Date();
+          this.timestampMode = "static";
+          this.timestampEl = $(`<div id=\"${this.path}-timestamp\" data-panelstatus=\"data-PanelStatus\"` + ` data-mode=\"${this.timestampMode}\" class=\"no-select\">` + "<span class=\"staticStr\">Not compiled.</span>" + "<span class=\"prefix\">Last updated </span>" + "<span class=\"timestamp\"></span>" + "</div>");
+          this.paneEl.append(this.timestampEl);
+          $(".timestamp", this.timestampEl).livestamp(new Date());
+          return this.timestampEnabled = true;
+        }
+
+        /*
+        Detach pane and its tab from DOM, saving DOM state that is lost when detached from DOM.
+        @param {Boolean} keepTab (optional) if true, keep tab in DOM.
+        */
+        detach(keepTab) {
+          Utils.assert(!this.isDetached(), "Pane already detached.");
+          this.DOMState = this.saveDOMState();
+          this.paneEl.detach();
+          if (!keepTab) {
+            return this.tabEl.detach();
+          }
+        }
+
+        /*
+        Is this pane detached from the DOM?
+        */
+        isDetached() {
+          return this.paneEl.parent().length === 0;
+        }
+
+        /*
+        It seems some state, like scroll positions is lost when elements are removed
+        from the DOM. Override this to save DOM state of this pane such as scroll positions
+        and restore it in restoreDOMState().
+        @return {Object} state object to be passed to restoreDOMState().
+        */
+        saveDOMState() {
+          return null;
+        }
+
+        /*
+        Restore DOM state of this pane such as scroll positions.
+        */
+        restoreDOMState(state) {
+          return null;
+        }
+
+        /*
+        Update timestamp to reflect current time.
+        */
+        updateTimestamp() {
+          $(".timestamp", this.timestampEl).livestamp(new Date());
+          if (this.timestampMode !== "time") {
+            this.timestampMode = "time";
+          }
+          return this.timestampEl.attr("data-mode", this.timestampMode);
+        }
+
+        /*
+        Get position of this pane's tab.
+        @return {int} tab position
+        */
+        getTabPosition() {
+          return this.tabbedview.getPosition(this.tabEl);
+        }
+
+        /*
+        Create a new tab status element.
+        @param {String} the status, as defined in {TabbedView.statusEl}
+        @return [Node] the new tab status node.
+        */
+        _newStatusNode(tabstatus) {
+          this.tabstatus = tabstatus;
+          return TabbedView.statusEl[this.tabstatus].cloneNode(true);
+        }
+
+        /*
+        Set the status of this Pane.
+        @param {String} tabstatus the new status value
+        */
+        setStatus(tabstatus) {
+          var el;
+          this.tabstatus = tabstatus;
+          el = this._newStatusNode(this.tabstatus);
+          this._tabStatusEl.replaceWith(el);
+          this._tabStatusEl = $(el);
+          this._tabStatusEl.attr("data-status", this.tabstatus);
+          // Update timestamp to reflect time of this status change.
+          if (this.timestampEnabled && ((this.tabstatus === "success") || (this.tabstatus === "fail"))) {
+            return this.updateTimestamp();
+          }
+        }
+
+        /*
+        Construct and add a label dropdown menu to the pane.
+        @param {Object} options Options passed to the blade model of the {PanelLabel}.
+        @return {Promise}
+        */
+        addLabel(options) {
+          this.label = new PanelLabel();
+          return this.label.init(this, options);
+        }
+
+        /*
+        Construct and add scroll controls to the pane.
+        @param {Object} options Options passed to the blade model of the {ScrollWrapper}.
+        @return {Promise}
+        */
+        addScrollWrapper(options = {}) {
+          this.scrollWrapper = new ScrollWrapper();
+          return this.scrollWrapper.init(this, options);
+        }
+
+        /*
+        Hides the PanelLabel, and listens for mouse movement to reinstate the button.
+        */
+        hideLabel() {
+          var el;
+          if (this.label.hidden) {
+            return;
+          }
+          this.label.hide();
+          el = this.paneEl;
+          return el.on("mousemove", () => {
+            if (!this.label.hidden) {
+              return;
+            }
+            this.label.show();
+            return el.off("mousemove");
+          });
+        }
+
+        /*
+        Set whether the tab is active, updating the DOM for the tab.
+        @param {Boolean} state the new state
+        */
+        setTabActive(state) {
+          if (this.active !== state) {
+            this.active = state;
+            if (state) {
+              return Utils.node(this.tabEl).classList.add("active");
+            } else {
+              return Utils.node(this.tabEl).classList.remove("active");
+            }
+          }
+        }
+
+        /*
+        Activates this pane (activates its tab and displays it)
+        */
+        activate() {
+          return this.tabbedview.activatePane(this);
+        }
+
+        /*
+        Close this Pane.
+        */
+        close() {
+          this.tabbedview.dissociate(this);
+          this.detach();
+          this.DOMState = null; // Reset DOM state in case this pane is reopened (though I think we reconstruct).
+          this.opened = false;
+          return this;
+        }
+
+        /*
+        HTML contents for a PDF pane.
+        */
+        pdfHtml(options) {
+          var filename, url;
+          url = options.contentUrl;
+          filename = url.split('/').pop();
+          return `<div style="width: 100%; height: 100%;">
+  <embed class="mc-dragover"
+        src="${url}"
+        type="application/pdf"
+        width="100%"
+        height="100%"
+        style="border: none;" />
+  <p>
+    <a href="${url}"
+      target="_blank"
+      rel="noopener noreferrer">
+      Open ${filename}
+    </a>
+  </p>
+</div>`;
+        }
+
+      };
+
+      // @property {int} My ID, assigned sequentially.
+      PaneComponent.prototype.seqID = null;
+
+      // @property {String} The name of the corresponding .blade file (without path or extension)
+      PaneComponent.prototype.bladeName = null;
+
+      // @property {String} My unique name, used for indexing panes and as the tab text.
+      PaneComponent.prototype.mnemonic = null;
+
+      // @property {Boolean} True if this pane can be closed.
+      PaneComponent.prototype.closable = false;
+
+      // @property {Boolean} True if this pane extends Pane.Scalable.
+      PaneComponent.prototype.scalable = false;
+
+      // @property {Boolean} True if this pane extends Pane.Scalable, in which case this {Pane}
+      // represents the state of simulationo at a given cycle.
+      PaneComponent.prototype.steppable = false;
+
+      // @property {Promise<@>} The promise returned by init(..), which can be used to perform
+      // actions that are dependent upon initialization.
+      PaneComponent.prototype.initPromise = null;
+
+      // @property {jQuery} the DOM element for the pane contents
+      PaneComponent.prototype.paneEl = null;
+
+      // @property {Object} This object holds the return value of @saveDOMState() to support DOM state
+      // restoration when panes are moved.
+      PaneComponent.prototype.DOMState = null;
+
+      // @property {jQuery} the DOM element for the tab.
+      PaneComponent.prototype.tabEl = null;
+
+      // @property {jQuery} the timestamp element.
+      PaneComponent.prototype.timeEl = null;
+
+      // @property {jQuery} the DOM element for the tab status.
+      PaneComponent.prototype._tabStatusEl = null;
+
+      // @property {TabbedView, jQuery} tabbedview or jQuery element into which to open this {Pane}.
+      PaneComponent.prototype.tabbedview = null;
+
+      // @property [boolean] True to include the pane in the DOM when not active.
+      PaneComponent.prototype.alwaysInDOM = true;
+
+      // @property {Boolean} Whether this pane is opened (has a tab in a {TabbedView}).
+      PaneComponent.prototype.opened = false;
+
+      // @property {Boolean} Whether this pane is active (selected)
+      PaneComponent.prototype.active = false;
+
+      // @property {Boolean} True if there's a timestamp.
+      PaneComponent.prototype.timestampEnabled = false;
+
+      // @property {PanelLabel} The {PanelLabel} of this {Pane} or null.
+      PaneComponent.prototype.label = null;
+
+      /*
+      @property {String} The status reflected in the tab.  Values are:
+
+      - "none" No status indication
+      - "success" A positive response (currently displayed as a checkmark)
+      - "fail" A negative response (currently displayed as an x)
+      - "working" Update pending (compile in progress) (currently displayed as a spinner)
+      - "unsaved" Unsaved content
+      - "outdated" Modified content (saved but not compiled) (currently displayed as a blue dot)
+      - "locked" Used by Waveform to indicate that the waveform is locked and simulations will not be run.
+      */
+      PaneComponent.prototype.tabstatus = "none";
+
+      return PaneComponent;
+
+    }).call(this);
+    PaneComponent.Rect = (function() {
+      class Rect {
+        constructor() {}
+
+        set(x1, y1, width, height) {
+          this.x = x1;
+          this.y = y1;
+          this.width = width;
+          this.height = height;
+          this.x2 = this.x + this.width;
+          this.y2 = this.y + this.height;
+          return this;
+        }
+
+      };
+
+      Rect.prototype.x = null;
+
+      Rect.prototype.y = null;
+
+      Rect.prototype.x2 = null;
+
+      Rect.prototype.y2 = null;
+
+      Rect.prototype.width = null;
+
+      Rect.prototype.height = null;
+
+      return Rect;
+
+    }).call(this);
+    Pane = (function() {
+      class Pane extends PaneComponent {
+        /*
+        Initialize and render the Pane.
+        @param {String} bladeName the name of the corresponding blade file (no path or extension).
+        @param {String} mnemonic a unique name for this Pane, used as tab text as well as unique identifier.
+                        (TODO: Can use 'name', but I was worried about conflict w/ base classes.  I think it's ok.)
+        @param {TabbedView, jQuery, null} tabbedview or jQuery element into which to open this {Pane} or
+                                          null to not open immediately.
+        @param {Object} options (optional) options passed to blade compile.
+        @return {Promise<@>} @initPromise (resolving to @).
+        */
+        initPane(bladeName, mnemonic, ide, project, tabbedview, options = {}) {
+          this.bladeName = bladeName;
+          this.mnemonic = mnemonic;
+          this.ide = ide;
+          this.project = project;
+          this.config = this.ide.config;
+          return super.initPane(this.bladeName, this.mnemonic, tabbedview, options);
+        }
+
+      };
+
+      // @property {null, IDE} The associate IDE if any.
+      Pane.prototype.ide = null;
+
+      // @property {Object} The app configuration object.
+      Pane.prototype.config = null;
+
+      // @property {Project} The associated project (if any).
+      Pane.prototype.project = null;
+
+      return Pane;
+
+    }).call(this);
+    /*
+    A mixin to extend Pane with controls for scaling the visual context.
+    @mixin
+
+      Zooming and Panning Methodology
+
+      Coordinate Systems:
+        Page coordinates:      In pixels, relative to the upper-left of the page. These are provided to mouse events.
+        Container coordinates: Also in pixels, where (0, 0) is the upper-left of the outermost <svg ...> element.
+        User coordinates:      The coordinates in the scalable context for the "user" to interact with.
+
+    */
+    Pane.Scalable = {
+      scalable: true, // Overrides {Pane.scalable} to indicate scalability.
+      
+      // @property {JQuery} The element that contains the drawing context.
+      contentContainerEl: null,
+      content: null,
+      // @property {Boolean} `true` if the content is being dragged, and click events for highlighting should be ignored.
+      dragging: false,
+      // @property {int} A bit mask of the zoom button bit for interactjs event.button.
+      ZOOM_BUTTON_MASK: 4,
+      // @property {int} Controls the sensitivity of mouse-drag zoom.
+      ZOOM_SLUGGISHNESS: 30,
+      // @property {int} Controls the sensitivity of pinch zoom.
+      PINCH_SLUGGISHNESS: 30,
+      // @property {int} Controls the sensitivity of wheel zoom.
+      WHEEL_ZOOM_SLUGGISHNESS_PIXELS: 200,
+      // @property {int} Controls the sensitivity of wheel zoom.
+      WHEEL_ZOOM_SLUGGISHNESS_LINES: 10,
+      // @property {int} Controls the sensitivity of wheel zoom.
+      WHEEL_ZOOM_SLUGGISHNESS_PAGES: 1,
+      scalableInitDOM: function() {
+        var buttonZoomSensitivity, keyboardZoom, keyboardZoomSensitivity, keycode, scalingEls;
+        scalingEls = $(`<div role="group" data-${this.mnemonic}-zooming="data-${this.mnemonic}-zooming"
+     class="btn-group mc-pane-controls mc-zooming-controls" id="${this.path}-zoom">
+  <button data-${this.mnemonic}-zoom="in" title="Zoom In" class="btn btn-secondary">
+    <i class="fa fa-fw fa-plus"></i></button>
+  <button data-${this.mnemonic}-zoom="out" title="Zoom Out" class="btn btn-secondary">
+    <i class="fa fa-fw fa-minus"></i></button>
+  <button data-${this.mnemonic}-zoom="reset" title="Reset Zoom" class="btn btn-secondary">
+    <i class="fa fa-fw fa-expand"></i></button>
+</div><div class="mc-scalable-container"><div>`);
+        // Append scaling elements to pane.
+        this.paneEl[0].children[0].appendChild(scalingEls[0]);
+        this.contentContainerEl = $(this.paneEl[0].children[0].appendChild(scalingEls[1]));
+        interact(`#${this.path} .mc-scalable-container`).draggable({
+          inertia: true
+        }).gesturable({
+          onmove: (e) => {
+            e.preventDefault();
+            if (this.content !== null && this.content.contentValid) {
+              // This isn't the right formula for pinch action. Quick and dirty, untested.
+              return this.content.zoomContentBy(1 + e.ds / this.PINCH_SLUGGISHNESS);
+            }
+          }
+        // Prevent "scroll-down to reload the page" on mobile while moving the content around
+        }).on('touchmove', function(e) {
+          return e.preventDefault();
+        // Set flag `@dragging` to disable mouseclicks
+        }).on('dragstart', (e) => {
+          return this.dragging = true;
+        // Remove flag `@dragging` to re-enable mouseclicks.
+        // Uses setTimeout to ensure that actions currently firing (on mouseup at the end of a drag)
+        // are still blocked from changing the content.
+        }).on('dragend', (e) => {
+          return setTimeout((() => {
+            return this.dragging = false;
+          }), 0);
+        // Zoom and pan the content by dragging.
+        }).on('dragmove', (e) => {
+          e.preventDefault();
+          if (this.content !== null && this.content.contentValid) {
+            if ((e.buttons & this.ZOOM_BUTTON_MASK) !== 0) {
+              return this.content.zoomContentBy - e.dy / this.ZOOM_SLUGGISHNESS;
+            } else {
+              return this.content.panContentBy(e.dx, e.dy);
+            }
+          }
+        });
+        this.contentContainerEl.on("wheel", (e) => {
+          var amt, sluggishness, userX, userY;
+          e.preventDefault();
+          if ((e.originalEvent == null) || (e.originalEvent.deltaY == null) || (e.originalEvent.deltaMode == null)) {
+            return;
+          }
+          if (this.content !== null && this.content.contentValid) {
+            sluggishness = e.originalEvent.deltaMode === 0 ? this.WHEEL_ZOOM_SLUGGISHNESS_PIXELS : e.originalEvent.deltaMode === 1 ? this.WHEEL_ZOOM_SLUGGISHNESS_LINES : this.WHEEL_ZOOM_SLUGGISHNESS_PAGES;
+            amt = -e.originalEvent.deltaY / sluggishness;
+            ({userX, userY} = this.userCoordsOfContainerEvent(e));
+            return this.content.zoomContentByAt(amt, userX, userY);
+          }
+        });
+        // Keyboard zooming
+        keyboardZoomSensitivity = 0.5;
+        keycode = {
+          leftBracket: 219,
+          rightBracket: 221,
+          // Both = and +
+          equals: 187,
+          minus: 189,
+          // For the keypad/numberpad:
+          kpMinus: 109,
+          kpPlus: 107
+        };
+        keyboardZoom = (e) => {
+          var ref, ref1;
+          if (!this._zoomListening) {
+            return;
+          }
+          if (this.content !== null && this.content.contentValid) {
+            if ((ref = e.keyCode) === keycode.rightBracket || ref === keycode.equals || ref === keycode.kpPlus) {
+              this.content.zoomContentBy(keyboardZoomSensitivity);
+            }
+            if ((ref1 = e.keyCode) === keycode.leftBracket || ref1 === keycode.minus || ref1 === keycode.kpMinus) {
+              return this.content.zoomContentBy(-1 * keyboardZoomSensitivity);
+            }
+          }
+        };
+        this.contentContainerEl.on("mouseenter", (e) => {
+          if (this._zoomListening) {
+            return;
+          }
+          $(document).on('keydown', keyboardZoom);
+          return this._zoomListening = true;
+        });
+        this.contentContainerEl.on("mouseleave", (e) => {
+          $(document).off("keydown", keyboardZoom);
+          return this._zoomListening = false;
+        });
+        buttonZoomSensitivity = 0.25;
+        Utils.$one(`[data-${this.mnemonic}-zoom='in']`, this.paneEl).click((e) => {
+          e.preventDefault();
+          if (this.content !== null && this.content.contentValid) {
+            return this.content.zoomContentBy(buttonZoomSensitivity);
+          }
+        });
+        Utils.$one(`[data-${this.mnemonic}-zoom='out']`, this.paneEl).click((e) => {
+          e.preventDefault();
+          if (this.content !== null && this.content.contentValid) {
+            return this.content.zoomContentBy(-1 * buttonZoomSensitivity);
+          }
+        });
+        return Utils.$one(`[data-${this.mnemonic}-zoom='reset']`, this.paneEl).click((e) => {
+          e.preventDefault();
+          if (this.content !== null && this.content.contentValid) {
+            this.content.centerContent(false);
+            return this.content.setContentScale(1.0);
+          }
+        });
+      },
+      // Return user coords {userX, userY} of event.
+      userCoordsOfContainerEvent: function(e) {
+        var bounds, el, ret;
+        el = this.contentContainerEl[0];
+        bounds = el.getBoundingClientRect();
+        ret = {
+          userX: this.content.userFocus.x + this.content.pixelsToUserUnits(e.pageX - (bounds.left + bounds.right) / 2.0),
+          userY: this.content.userFocus.y + this.content.pixelsToUserUnits(e.pageY - (bounds.top + bounds.bottom) / 2.0)
+        };
+        return ret;
+      }
+    };
+    Pane.ScalableContent = (function() {
+      /*
+      The contents of a Pane.Scalable. This has all the functionality for zooming/panning without
+      applying the properties to the DOM. Derived classes apply these properties appropriately to
+      the DOM for specific types of content (SVG, FabricJS, etc.)
+      */
+      class ScalableContent {
+        constructor(pane) {
+          this.construct(pane);
+        }
+
+        construct(pane1) {
+          this.pane = pane1;
+          return this.contentContainerEl = this.pane.contentContainerEl;
+        }
+
+        /*
+        For derived classes to define with their own content initialization.
+        */
+        initContent() {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        Center the content
+        @param {Boolean} refresh (optional) whether to refresh to reflect the changes, default true
+        */
+        centerContent(refresh = true) {
+          var contentCenterX, contentCenterY;
+          contentCenterX = (this.userBounds.x + this.userBounds.x2) / 2.0;
+          contentCenterY = (this.userBounds.y + this.userBounds.y2) / 2.0;
+          return this.focusContentOn(contentCenterX, contentCenterY, refresh);
+        }
+
+        /*
+        Zoom by the given power of two: exp = 1 zooms in 2x scale, exp = 0 does nothing, exp = -1 zooms out to 1/2 scale
+        @param {Number} exp the power of 2 to scale by
+        @param {Boolean} refresh (optional) whether to refresh the DOM to reflect the changes, default true
+        */
+        zoomContentBy(exp, refresh = true) {
+          return this.setContentScale(this.contentScale * Math.pow(2, exp), refresh);
+        }
+
+        /*
+        Zoom by the given power of two: exp = 1 zooms in 2x scale, exp = 0 does nothing, exp = -1 zooms out to 1/2 scale
+        at given user coords.
+        @param {Number} exp the power of 2 to scale by
+        @param {Number} x user X coord
+        @param {Number} y user Y coord
+        @param {Boolean} refresh (optional) whether to refresh the DOM to reflect the changes, default true
+        */
+        zoomContentByAt(exp, userX, userY, refresh = true) {
+          var scaling_factor;
+          this.zoomContentBy(exp, false);
+          scaling_factor = Math.pow(2, exp);
+          return this.focusContentOn(this.userFocus.x + (userX - this.userFocus.x) * (scaling_factor - 1.0) / scaling_factor, this.userFocus.y + (userY - this.userFocus.y) * (scaling_factor - 1.0) / scaling_factor, refresh);
+        }
+
+        /*
+        Pan by given amount (in pixels)
+        @param {Number} d_left amount to pan left
+        @param {Number} d_top amount to pan up
+        @param {Boolean} refresh (optional) whether to refresh the DOM to reflect the changes, default true
+        */
+        panContentBy(d_left, d_top, refresh = true) {
+          return this.focusContentOn(this.userFocus.x - this.pixelsToUserUnits(d_left), this.userFocus.y - this.pixelsToUserUnits(d_top), refresh);
+        }
+
+        /*
+        Set the focal point of the content (the point that is centered in the view),
+        but not beyond the bounds of the content.
+        @param {Number} x the x-coord to focus on
+        @param {Number} y the y-coord to focus on
+        @param {Boolean} refresh (optional) whether to refresh to reflect the changes, default true
+        */
+        focusContentOn(x, y, refresh = true) {
+          if (x > this.userBounds.x2) {
+            x = this.userBounds.x2;
+          }
+          if (x < this.userBounds.x) {
+            x = this.userBounds.x;
+          }
+          if (y > this.userBounds.y2) {
+            y = this.userBounds.y2;
+          }
+          if (y < this.userBounds.y) {
+            y = this.userBounds.y;
+          }
+          this.userFocus = {x, y};
+          if (refresh) {
+            return this.refreshContentPosition();
+          }
+        }
+
+        positionNewContent() {
+          if (this.is_first) {
+            return this.centerContent();
+          } else {
+            return this.focusContentOn(this.userFocus.x, this.userFocus.y);
+          }
+        }
+
+        /*
+        Set the scale of the content
+        @param {Number} scale the new scale of the content
+        @param {Boolean} refresh (optional) whether to refresh the content to reflect the changes, default true
+        */
+        setContentScale(scale, refresh = true) {
+          this.contentScale = scale;
+          if (refresh) {
+            return this.refreshContentPosition();
+          }
+        }
+
+        /*
+        Reflect the content position/scale in the DOM.
+        */
+        refreshContentPosition() {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        Converts number of pixels to user units
+        @param {Number} px the dimension (or distance) in pixels
+        @return {Number} the resulting number of user units
+        */
+        pixelsToUserUnits(px) {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        Perform any necessary cleanup to destroy cleanly.
+        */
+        destroy() {}
+
+      };
+
+      // @property {JQuery} The element that contains the drawing context.
+      ScalableContent.prototype.contentContainerEl = null;
+
+      // @property {Pane} The containing {Pane}.
+      ScalableContent.prototype.pane = null;
+
+      // @property {Boolean} True to indicate that the content is valid.
+      ScalableContent.prototype.contentValid = false;
+
+      // @property {PaneComponent.Rect} the bounds of the drawing context
+      ScalableContent.prototype.userBounds = null;
+
+      // @property [Object] `{x, y}` determines the user coordinates of the focal point
+      // (the point centered in the viewport)
+      ScalableContent.prototype.userFocus = null;
+
+      // @property {Number} Scale of the content.
+      ScalableContent.prototype.contentScale = 1.0;
+
+      // @property {Boolean} Constructs as true. Can be set to false to indicate to future
+      //                     content initialization that initialization and positioning have
+      //                     already been established.
+      ScalableContent.prototype.is_first = true;
+
+      return ScalableContent;
+
+    }).call(this);
+    Pane.ScalableSVG = (function() {
+      /*
+      SVG-specific scalable context.
+      */
+      class ScalableSVG extends Pane.ScalableContent {
+        constructor(pane) {
+          super(pane);
+        }
+
+        /*
+        Set @userBounds for new SVG content.
+        @param {Object} viewbox the SVG's viewbox (which is useful for graphviz, but should change to become more generic)
+        */
+        setBounds(viewbox) {
+          return Utils.abstractMethod();
+        }
+
+        /*
+        Displays the given SVG.
+
+        We reassign the viewbox to have user coords (0.0, 0.0) in its center, and we initially translate the center of
+        the SVG content to be at viewbox (0.0, 0.0). We leave the scale of
+        (1 1) (initially) to encompass the whole drawing in the viewport.
+
+        @param {String} newSVG The new SVG content.
+        */
+        newSVG(_newSVG) {
+          var str, svgEl, viewBox;
+          // Fill in GraphViz SVG HTML
+          svgEl = $(_newSVG);
+          svgEl = svgEl.filter("svg");
+          if (svgEl.length !== 1) {
+            return this.pane.setStatus("fail"); // TODO: There's no indication to the user of the nature of the failure
+          } else {
+            this.contentValid = true;
+            this.pane.setStatus("success");
+            this.svgDOMEl = svgEl.get(0);
+            this.gDOMEl = Utils.$one(svgEl.children("g"));
+            Utils.assert(this.gDOMEl.length === 1);
+            // Make viewbox and translation adjustments to GraphViz SVG
+            // Position viewbox (0.0, 0.0) in center of viewport.
+            // These equations are hardcoded based on behavior of graphviz.
+            viewBox = this.svgDOMEl.viewBox.baseVal;
+            this.userBounds = new PaneComponent.Rect();
+            this.setBounds(viewBox);
+            str = -(this.userBounds.width / 2.0) + " " + -(this.userBounds.height / 2.0) + " " + this.userBounds.width + " " + this.userBounds.height;
+            this.svgDOMEl.setAttribute("viewBox", str);
+            this.positionNewContent();
+            // Add SVG to DOM. TODO: Can this go after @initContent() (which does interactjs init)?
+            this.contentContainerEl.children().replaceWith(svgEl);
+            if (this.is_first) {
+              this.initContent();
+            }
+            return this.is_first = false;
+          }
+        }
+
+        /*
+        Converts number of pixels to user units
+        @param {Number} px the dimension (or distance) in pixels
+        @return {Number} the resulting number of user units
+        */
+        pixelsToUserUnits(px) {
+          var clientHeight, clientWidth, if_x_bound, if_y_bound;
+          ({clientWidth, clientHeight} = this.contentContainerEl[0]);
+          if_x_bound = this.userBounds.width / clientWidth;
+          if_y_bound = this.userBounds.height / clientHeight;
+          return px * Math.max(if_x_bound, if_y_bound) / this.contentScale;
+        }
+
+        /*
+        Reflect contentScale and userFocus x/y in the DOM.
+        */
+        refreshContentPosition() {
+          var str;
+          str = `scale(${this.contentScale}) rotate(0) translate(${-this.userFocus.x} ${-this.userFocus.y})`;
+          return this.gDOMEl.attr("transform", str);
+        }
+
+        /*
+        (UNUSED)
+        Parses the transformation attribute on the <g> element inside the SVG.
+        @return [Object] `{scale, rotate, focus: {x, y}}`
+        */
+        parseGTransform() {
+          var all, focus, re, rotate, scale, str;
+          focus = {};
+          str = this.gDOMEl.attr("transform");
+          re = /scale\(([0-9\.-]+)(?:\s[0-9\.-]+)?\)\srotate\(([0-9\.-]+)\)\stranslate\(([0-9\.-]+)\s([0-9\.-]+)\)/;
+          [all, scale, rotate, focus.x, focus.y] = str.match(re);
+          scale = parseInt(scale, 10);
+          rotate = parseInt(rotate, 10);
+          focus.x = -parseInt(focus.x, 10);
+          focus.y = -parseInt(focus.y, 10);
+          return {scale, rotate, focus};
+        }
+
+      };
+
+      // @property {Element} the DOM element of the <g> inside the <svg>.
+      ScalableSVG.prototype.gDOMEl = null;
+
+      return ScalableSVG;
+
+    }).call(this);
+    /*
+    A mixin to extend Pane with features for representing the state of
+    simulation at a given cycle.
+    Derived class must provide:
+    updateCycle: (newCyc) ->   # called when the cycle is updated
+    @mixin
+    */
+    Pane.Steppable = {
+      steppable: true, // Overrides {Pane.steppable} to indicate steppability.
+      
+      // @property {Number, null} cyc cycle reflected in the canvas
+      cyc: null,
+      // @property {jQuery} Single element whose value is the cycle number.
+      cycEl: null,
+      // @property {WaveData} Set by derived class.
+      waveData: null,
+      // @property {ScrollWrapper} The scroll wrapper component
+      scrollWrapper: null,
+      //# Initialization.
+      //steppableInit: ->
+
+      // Initializes the DOM for the steppable pane.
+      // @param {Object} options Options passed to the blade model of the {ScrollWrapper}.
+      // @return {Promise<@>}
+      steppableInitDOM: function(options) {
+        return this.addScrollWrapper(options).then((scrollWrapper) => {
+          this._navigationListening = false;
+          this.project.on("cycle-update", (newCyc) => {
+            return this.setMyCycle(newCyc);
+          });
+          this.project.on("play-state-change", (isPlaying, cycleTimeout) => {
+            return this.updatePlayStateUI(isPlaying, cycleTimeout);
+          });
+          // Now listening for project updates.
+          // Sync w/ project state.
+          this.setMyCycle(this.project.cyc);
+          this.updatePlayStateUI(this.project.isPlaying, this.project.cycleTimeout);
+          return this;
+        });
+      },
+      /*
+      Reflect updated play state in the UI.
+      @param {Boolean} isPlaying the new play state
+      @param {int} cycleTimeout the new cycle timeout
+      */
+      updatePlayStateUI: function(isPlaying, cycleTimeout) {
+        // update UI
+        return this.scrollWrapper.updatePlayStateUI(isPlaying, cycleTimeout);
+      },
+      updateBubble: function() {
+        if (this.waveData && this.cyc !== null) {
+          return this.scrollWrapper.updateCycle(this.cyc);
+        }
+      },
+      /*
+      Set the WaveData object for this Pane.
+      @param {WaveData, null} waveData The WaveData object for this Pane or null.
+      */
+      setWaveData: function(waveData) {
+        this.waveData = waveData;
+        if (this.waveData) {
+          // TODO: This could be cleaner. Panes should get waveData from the IDE. VIZ especially needs cleanup for this.
+          this.scrollWrapper.updateSliderRange(this.waveData);
+          // Refresh view to the new data and to the central cycle which might differ if
+          // this WaveData is set at a different time than the central one.
+          return this.setMyCycle(this.project.cyc);
+        }
+      },
+      goDead: function() {
+        this.isLive = false;
+        if (typeof this.resetSignalColor === "function") {
+          this.resetSignalColor();
+        }
+        this.paneEl.removeClass("live-mode");
+        if (this.project.isPlaying) {
+          this.project.updatePlayState(false);
+        }
+        Utils.$one(".play-icon", this.paneEl).removeClass("fa-pause").addClass("fa-play");
+        Utils.$one(".go-live-btn", this.paneEl).removeClass("active");
+        return typeof this.myGoDead === "function" ? this.myGoDead() : void 0;
+      },
+      goLive: function() {
+        this.isLive = true;
+        if (typeof this.updateBubble === "function") {
+          this.updateBubble();
+        }
+        this.paneEl.addClass("live-mode");
+        Utils.$one(".go-live-btn", this.paneEl).addClass("active");
+        if (typeof this.myGoLive === "function") {
+          this.myGoLive();
+        }
+        return typeof this.setCycle === "function" ? this.setCycle(this.cyc) : void 0;
+      },
+      /*
+      Go to the previous cycle.
+      */
+      prevCycle: function() {
+        if (this.cyc > 0) {
+          return this.setCycle(this.cyc - 1);
+        }
+      },
+      /*
+      Go to the next cycle.
+      */
+      nextCycle: function() {
+        var max;
+        max = this.waveData ? this.waveData.getEndCycle() : 0;
+        if (this.cyc < max) {
+          return this.setCycle(this.cyc + 1);
+        }
+      },
+      /*
+      Set the central cycle to a new value (within central wavedata bounds), updating
+      DOM as needed and stopping playing.
+      @param {int} newCyc the new value for @cyc
+      */
+      setCycle: function(newCyc) {
+        return this.project.setCycle(newCyc);
+      },
+      /*
+      Set the cycle of this Pane only.
+      @param {int} newCyc the new value for @cyc
+      */
+      setMyCycle: function(newCyc) {
+        var max, min, scrollEl;
+        // Bounds checking.
+        // This is done centrally as well, but Pane WaveData can differ among Panes, so this is
+        // needed to keep the cycle in range for this Pane.
+        min = 0;
+        max = this.waveData ? this.waveData.getEndCycle() : min;
+        if (newCyc < min) {
+          newCyc = min;
+        }
+        if (newCyc > max) {
+          newCyc = max;
+        }
+        scrollEl = Utils.$one(".scroll-bar", this.paneEl);
+        scrollEl.val(newCyc);
+        this.cyc = newCyc;
+        // @scrollWrapper.updateSliderValue(newCyc)
+        // @scrollWrapper.updateBubble(newCyc)
+        this.scrollWrapper.updateCycle(newCyc);
+        return this.updateCycle(this.cyc);
+      }
+    };
+    Utils.extend(Pane, module.config());
+    Utils.extend(Pane, BladeComponent);
+    return Pane;
+  });
+
+}).call(this);

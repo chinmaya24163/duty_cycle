@@ -1,0 +1,147 @@
+(function() {
+  define("StaticPanes", function(require, exports, module) {
+    /*
+    A collection of Panes, each with content defined in a Blade file.
+    */
+    var $, Logging, Pane, Promise, StaticPanes, Utils;
+    Pane = require("Pane");
+    $ = require("jquery");
+    Logging = require("Logging");
+    Utils = require("Utils");
+    StaticPanes = (function() {
+      class StaticPanes {
+        /*
+        Constructor
+        */
+        constructor(ide) {
+          var aboutName, opts, tutorial;
+          this.ide = ide;
+          tutorial = null;
+          opts = {
+            closable: true
+          };
+          this.panes = {};
+          // These {Panes} can be identified by the 3rd argument to newPane(..) which is the
+          // name that appears in their tab.
+          // Args: @newPane(args, bladeName/id, mnemonic (tab heading), tags, opts)
+          aboutName = this.ide.config.configID === "sandstorm" ? "AboutSandStorm" : "About";
+          this.newPane([], aboutName, "About", {}, opts);
+          this.newPane([], "Help", "Help", {}, opts);
+          this.newPane([], "MakerchipTutorial", `${this.ide.config.product} Tutorial`, {tutorial}, opts);
+          this.newPane([], "CombinationalLogicTutorial", "Tutorial-Combo", {tutorial}, opts);
+          this.newPane([], "SequentialLogicTutorial", "Tutorial-Seq", {tutorial}, opts);
+          this.newPane([], "PipelineTutorial", "Tutorial-Pipes", {tutorial}, opts);
+          this.newPane([], "ValidityTutorial", "Tutorial-Valid", {tutorial}, opts);
+          this.newPane([], "AlignmentTutorial", "Tutorial-Align", {tutorial}, opts);
+          this.newPane([], "HierarchyTutorial", "Tutorial-Hier", {tutorial}, opts);
+          this.newPane([], "StateTutorial", "Tutorial-State", {tutorial}, opts);
+          this.newPane([], "TLVMacrosTutorial", "Tutorial-TLV-Macros", {tutorial}, opts);
+          this.newPane([], "FlowTutorial", "Tutorial-Flow", {tutorial}, opts);
+          this.newPane([], "Tutorials", "Tutorials", {tutorial}, opts);
+          this.newPane([], "CodeExamples", "Code-Examples", {tutorial}, opts);
+          this.newPane([], "Courses", "Courses", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/courses/CourseSlides.pdf")}`], "CourseSlides", "Course Slides", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/courses/VSDOpen2020_RISC-V_Tutorial_Slides.pdf")}`], "VSDOpenSlides", "VSDOpen Slides", {}, opts);
+          this.newPane([], "VSDOpenVideos", "VSDOpen Videos", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/courses/ChipEXPO-2021_RISC-V_Workshop_Slides.pdf")}`], "ChipEXPOSlides", "ChipEXPO Slides", {}, opts);
+          this.newPane([], "ChipEXPOVideos", "ChipEXPO Videos", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/courses/MYTHWorkshopSlides.pdf")}`], "MYTHWorkshopSlides", "MYTH Slides", {}, opts);
+          this.newPane([], "MYTHWorkshopVideos", "MYTH Videos", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/courses/RISCVWorkshopSlides.pdf")}`], "RISCVWorkshopSlides", "RISC-V Slides", {}, opts);
+          this.newPane([], "RISCVWorkshopVideos", "RISC-V Videos", {}, opts);
+          this.newPane([], "Single-Cycle_CPUCourse", "Single-Cycle CPU", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/courses/TL-VerilogTexasAM_CSCE689.pdf")}`], "TAMVerifSlides", "Verif Slides", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/docs/ICCD2017Paper.pdf")}`], "ICCD2017Paper", "TA Paper", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/docs/TopDownDesign.pdf")}`], "TopDownDesign", "Top-Down Paper", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/docs/TLXSpec.pdf")}`], "TLXSpec", "TL-X Spec", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/docs/TLV_Macros_Guide.pdf")}`], "TLVMacrosGuide", "Macros Guide", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/docs/M5_spec.pdf")}`], "M5Spec", "M5 Spec", {}, opts);
+          this.newPane(["pdf", `${window.appApiUrl("/public/docs/VisualDebugUsersGuide.pdf")}`], "VIZ_UsersGuide", "VIZ Guide", {}, opts);
+          this.newPane(["iframe", `${window.appApiUrl("/viz_docs")}`], "VIZ_API_Spec", "VIZ API", {}, opts);
+        }
+
+        /*
+        Create a new static {Pane}.
+        There is no formal class for a StaticPane. It is just a {Pane} with
+        the following fields tacked on:
+          tags (may include "tutorial")  (but I don't think we actually use "tutorial" for anything)
+        @param {args} content-type-specific arguments ([] for blade, ["pdf"/"iframe", URL] for PDF/iframe content) The type of content to load.
+        @param {String} bladeName/id The name of the Blade file (if blade content) as for {Pane}.init(..) and a unique id for DOM `ids`.
+        @param {String} mnemonic A unique name for the tab used as the tab title as for {Pane}.init(..).
+        @param {Object} tags An object characterizing the {Pane}, together with args; expected values:
+                             {}, {tutorial: null}
+                        name and opts args are appended for later use in initialization.
+        @param {Object} opts As for {Pane}.init(..). contentType property is added from args.
+        */
+        newPane(args, bladeName, mnemonic, tags, opts) {
+          var key, pane, value;
+          pane = new Pane();
+          pane.tags = tags;
+          pane.tags.bladeName = bladeName;
+          pane.tags.mnemonic = mnemonic;
+          pane.tags.opts = {};
+          for (key in opts) {
+            value = opts[key];
+            pane.tags.opts[key] = value;
+          }
+          if (args.length > 0) {
+            // Non-blade content (presumably PDF or iframe).
+            pane.tags.opts.contentType = args[0];
+            pane.tags.opts.contentUrl = args[1];
+          }
+          // Add it to @panes.
+          this.panes[mnemonic] = pane;
+          return pane;
+        }
+
+        /*
+        Initialize the given {Pane}, based on parameters provided by newPane(..).
+        @param {Pane} pane The static {Pane} to initialize.
+        @return {Promise<Pane>}
+        */
+        init(mnemonic) {
+          var pane;
+          if (typeof window.ga === "function") {
+            window.ga("send", {
+              hitType: "event",
+              eventCategory: "Static Page",
+              eventAction: "open",
+              eventLabel: mnemonic
+            });
+          }
+          pane = this.panes[mnemonic];
+          Utils.assert(mnemonic === pane.tags.mnemonic);
+          return pane.initPane(pane.tags.bladeName, mnemonic, this.ide, null, null, pane.tags.opts).then(function(pane) {
+            // Attach events.
+            // Quiz answers.
+            $('.mc-correct-answer', pane.paneEl).click(function() {
+              return $(this).addClass('revealed');
+            });
+            $('.mc-wrong-answer', pane.paneEl).click(function() {
+              return $(this).addClass('revealed');
+            });
+            // Steps.
+            $('.mc-tutorial-step', pane.paneEl).click(function() {
+              // Toggle existance of "done" class.
+              return $(this).toggleClass('done');
+            });
+            return pane;
+          });
+        }
+
+      };
+
+      // @property {Object} The static {Pane}s.
+      StaticPanes.prototype.panes = null;
+
+      // @property {IDE} The associated IDE.
+      StaticPanes.prototype.ide = null;
+
+      return StaticPanes;
+
+    }).call(this);
+    Promise = require("bluebird");
+    return StaticPanes;
+  });
+
+}).call(this);

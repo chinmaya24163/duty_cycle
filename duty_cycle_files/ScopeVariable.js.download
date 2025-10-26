@@ -1,0 +1,88 @@
+(function() {
+
+  /*
+  A "scope" in the VCD
+  */
+  var $, ScopeVariable;
+
+  [$] = [];
+
+  ScopeVariable = (function() {
+    class ScopeVariable {
+      /*
+      @param {String} name the current scope name of this scope
+      @param {ScopeVariable} parent the parent scopeVariable of this scope
+      */
+      constructor(name, parent, depth, instance = "") {
+        var mindex, numre, re;
+        this.parent = parent;
+        this.depth = depth;
+        this.instance = instance;
+        re = new RegExp(/.*\([0-9]+\)/);
+        numre = new RegExp(/[0-9]+/);
+        if (re.test(name)) {
+          name = name.replace("(", "[").replace(")", "]"); //replaces (0) with [0] styling
+        }
+        if (this.instance.length > 0) {
+          name += "[" + this.instance.match(numre)[0] + "]";
+        }
+        this.conditions = [];
+        if (name.indexOf("?") === -1) { // ? used to signal when conditions
+          // insert / divider when scope does not have a built in TLV divider
+          this.name = this.expandName(name);
+        } else {
+          console.log("Debug: Oh, we actually got here: ScopeVariable.constructor() with '?'");
+          //treat when conditions for a whole scope
+          name = name.substring(1); //chops off leading '?'
+          while (name.indexOf("?") > -1) { //loop through conditions
+            this.conditions.push(this.parent != null ? this.expandName(name) : name + name.substring(0, name.indexOf("?")));
+            name = name.substring(name.indexOf("?") + 1);
+          }
+          //sorts found indices to get first nonnegative
+          mindex = [name.indexOf("/"), name.indexOf(">"), name.indexOf("|")].filter(function(x) {
+            return x >= 0;
+          }).sort(function(a, b) {
+            return a > b;
+          }).shift();
+          this.conditions.push(this.parent != null ? this.expandName(name) : name + name.substring(0, mindex));
+          name = name.substring(mindex);
+          this.name = this.expandName(name);
+        }
+      }
+
+      /*
+      Expand the name out to include the parent
+      */
+      expandName(name) {
+        var ref;
+        return (this.parent != null ? this.parent.name + (((this.parent.name.length === 0) || ((ref = name.charAt(0)) === "/" || ref === ">" || ref === "|")) ? "" : ".") : "") + name;
+      }
+
+    };
+
+    // @property {String} name is the name of this scope
+    ScopeVariable.prototype.name = "";
+
+    // @property {ScopeVariable} the parent scope of this scope
+    ScopeVariable.prototype.parent = null;
+
+    // @property {Number} the scope depth of this scope
+    ScopeVariable.prototype.depth = -1;
+
+    // @property {String} the string instance of this scope ( [1] )
+    ScopeVariable.prototype.instance = "";
+
+    // @property {Array<String>} the TL-Verilog 'when' conditions for this scope
+    ScopeVariable.prototype.conditions = null;
+
+    return ScopeVariable;
+
+  }).call(this);
+
+  define(function(require, exports, module) {
+    $ = require("jquery");
+    $.extend(ScopeVariable.prototype, module.config());
+    return ScopeVariable;
+  });
+
+}).call(this);

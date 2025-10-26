@@ -1,0 +1,67 @@
+(function() {
+  define("PanelLabel", function(require, exports, module) {
+    /*
+    Describes a floating menu to appear at the top right of a panel.
+
+    @extend BladeComponent
+    @extend ModuleConfigObject
+    */
+    var $, BladeComponent, PanelLabel, Utils;
+    BladeComponent = require("BladeComponent");
+    $ = require("jquery");
+    Utils = require("Utils");
+    PanelLabel = (function() {
+      class PanelLabel {
+        init(pane, options) {
+          this.path = pane.childPath("label");
+          //@_renderListen = -> "##{@path} [data-PanelLabel]"
+          this.hidden = false;
+          options["path"] = this.path;
+          return this.compileComponent("PanelLabel", options).then((html) => {
+            this.el = $(html);
+            pane.paneEl.append(this.el);
+            return this;
+          }).catch(function(err) {
+            return console.log(err);
+          });
+        }
+
+        /*
+        Hides this label.
+        */
+        hide() {
+          if (this.hidden) {
+            return;
+          }
+          return this.el.fadeTo(150, 0.2, "swing", () => {
+            return this.hidden = true;
+          });
+        }
+
+        /*
+        Shows this label.
+        */
+        show() {
+          if (!this.hidden) {
+            return;
+          }
+          this.hidden = false;
+          return this.el.fadeTo(150, 1.0, "swing", () => {
+            return this.hidden = false;
+          });
+        }
+
+      };
+
+      // @property {jQuery} jQuery of the DOM element of this PanelLabel.
+      PanelLabel.prototype.el = null;
+
+      return PanelLabel;
+
+    }).call(this);
+    Utils.extend(PanelLabel, module.config());
+    Utils.extend(PanelLabel, BladeComponent);
+    return PanelLabel;
+  });
+
+}).call(this);

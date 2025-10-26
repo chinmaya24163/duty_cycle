@@ -1,0 +1,184 @@
+(function() {
+
+  /*
+  Generic utility functions.
+  */
+  var $, Logging, Promise, Utils;
+
+  [Logging, $, Promise, Utils] = [];
+
+  Utils = {};
+
+  /*
+  Assert that a condition must be true.
+  @param {Boolean} cond the condition which should be true
+  @param {String, closure} message a message or method to return one to report on failure
+  */
+  Utils.assert = function(cond, message) {
+    var msg;
+    if (!cond) {
+      msg = !message ? "Failed assertion (reporting only once)." : typeof message === "string" ? message : message();
+      Utils.alert(msg, true);
+    }
+    return null;
+  };
+
+  /*
+  User-visible alert.
+  @param {String} msg the message to display
+  */
+  Utils.alert = function(msg, once = false) {
+    if (!once || !window.assertionFlag) {
+      if (once) {
+        window.assertionFlag = true;
+      }
+      alert(msg);
+      console.log(msg);
+      debugger;
+    }
+    return null;
+  };
+
+  /*
+  Apply a mixin. Klass takes priority by default (like the mixin is a parent class).
+  @param {Class} klass The class to which to apply the mixin.
+  @param {Object} mixin The "mixin" to apply.
+  @param {Boolean, Object} silent isnt true (default) to report conflicts; true to silently drop conflicting members; or an
+                                     object whose truthy members' keys are field names for which to not report conflicts.
+  @param {Boolean, Object} mixin_overrides isnt true (default) to give precedence to members of klass; true to give precedence to mixin; or an
+                                           object whose truthy members' keys are field names for which mixin gets precedence.
+  */
+  Utils.extend = function(klass, mixin, silent, mixin_overrides) {
+    var method, name, override_mixin, proto, results;
+    proto = klass.prototype;
+    results = [];
+    for (name in mixin) {
+      method = mixin[name];
+      if (proto[name]) {
+        override_mixin = false;
+        if (mixin_overrides === true || (mixin_overrides != null ? mixin_overrides[name] : void 0)) {
+          override_mixin = true;
+          proto[name] = method;
+        }
+        if (silent !== true && !(silent != null ? silent[name] : void 0)) {
+          results.push(console.log(`While applying ${mixin.name || "an object"} as a mixin to ${klass.name || "an object"}` + `, member \"${name}\" conflicts. Mixin's member is ${override_mixin ? "used" : "dropped"}.`));
+        } else {
+          results.push(void 0);
+        }
+      } else {
+        results.push(proto[name] = method);
+      }
+    }
+    return results;
+  };
+
+  /*
+  "Abstract" methods can call this.
+  */
+  Utils.abstractMethod = function() {
+    return Utils.unusedCode("Abstract method has no definition.");
+  };
+
+  /*
+  Call this for unusedCode.
+  */
+  Utils.unusedCode = function() {
+    return Utils.report("Reached code that was supposed to be unused.");
+  };
+
+  /*
+  Call this for unwrittenCode.
+  */
+  Utils.unwrittenCode = function() {
+    return Utils.report("Reached unwritten code.");
+  };
+
+  /*
+  Report time on console for performance debug (though, generally browser performance debug is better).
+  @param {String} tag an identifier to include in the printed string.
+  */
+  Utils.reportTime = function(tag) {
+    var delta, ms, str;
+    ms = new Date().getTime();
+    str = `Time: ${ms}`;
+    if (window.lastReportTime != null) {
+      delta = ms - window.lastReportTime;
+      str = `Elapsed: ${delta}, ${str}`;
+    }
+    str = `${str} | (${tag})`;
+    console.log(str);
+    return window.lastReportTime = ms;
+  };
+
+  /*
+  Report a message.
+  */
+  Utils.report = function(msg) {
+    console.log(msg);
+    return console.trace();
+  };
+
+  /*
+  Deep merge two objects.
+  @param target
+  @param sources...
+  */
+  Utils.deepMerge = function(target, ...sources) {
+    var i, key, len, results, source;
+    if (!sources.length) {
+      return target;
+    }
+    source = sources.shift();
+    if (isObject(target) && isObject(source)) {
+      results = [];
+      for (i = 0, len = source.length; i < len; i++) {
+        key = source[i];
+        if (isObject(source[key])) {
+          if (!target[key]) {
+            Object.assign(target, { [key]: {} });
+          }
+          results.push(deepMerge(target[key], source[key]));
+        } else {
+          results.push(Object.assign(target, { [key]: source[key] }));
+        }
+      }
+      return results;
+    }
+  };
+
+  /*
+  @param {String} sel the selector expression
+  @param {Object} context a DOM Element, Document, or jQuery to use as context
+  @return {jQuery} the single-element {jQuery}
+  */
+  Utils.$one = function(sel, context) {
+    var els;
+    els = $(sel, context);
+    Utils.assert(els.length === 1, function() {
+      return `\"${sel}\" matched ${els.length} elements.`;
+    });
+    return els;
+  };
+
+  /*
+  @param {String} sel the selector expression
+  @param {Object} context a DOM Element, Document, or jQuery to use as context
+  @return [Node] the single [Node]
+  */
+  Utils.node = function(sel, context) {
+    var els;
+    els = $(sel, context);
+    Utils.assert(els.length === 1, function() {
+      return `\"${sel}\" matched ${els.length} elements.`;
+    });
+    return els[0];
+  };
+
+  define("Utils", function(require, exports, module) {
+    Logging = require("Logging");
+    Promise = require("bluebird");
+    $ = require("jquery");
+    return Utils;
+  });
+
+}).call(this);

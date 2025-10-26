@@ -1,0 +1,208 @@
+(function() {
+  var $, SignalValueSet, Utils;
+
+  [$, Utils] = [];
+
+  SignalValueSet = (function() {
+    /*
+    Class representing a set of {SignalValue}'s that can step signals in unison. This class has similar
+    methods to those of {SignalValue}
+    that operate on all signals in the set. Transition-based methods use a representative signal to identify
+    transitions. Methods that can be chained in {SignalValue} can also be
+    chained in {SignalValueSet}. The signals of the set are not required to have the same cycle value.
+    Methods adjust signals in unison, preserving their relative cycle times. {SignalValue}s of the set may
+    be operated on outside of this class.
+    */
+    // @exclude
+    /*
+    TODO: Functions that update to a given cycle update all
+    signals to that exact cycle, even if their original cycles were misaligned. Some functions that
+    act based on a signal value take an additional representative argument that provides that signal,
+    which may or may not be in the set.
+
+    TODO: Add a default representative signal. Well, no. As currently defined, this is a bit awkward because
+          `rep` is always the first argument, so it can't be cleanly defaulted.
+          It would have been better to use:
+          set.with(repSig).step(2).forwardToValue(0)
+          vs.
+          set.step(2).forwardToValue(repSig, 0)
+
+    TODO: Complete missing methods.
+    */
+    // @include
+    class SignalValueSet {
+      
+        // @include
+      /*
+      @param {Array<SignalValue>} sigs the set of signals
+      */
+      constructor(sigs) {
+        this._sigs = sigs;
+        null;
+      }
+
+      sig(name) {
+        return this._sigs[name];
+      }
+
+      /*
+      Increment the current cycle by the given amount (positive or negative)
+      (as efficiently as possible).
+      @param {int} cyc
+      @return {SignalValueSet} (for chaining)
+      */
+      step(cyc = 1) {
+        var name, ref, sig;
+        ref = this._sigs;
+        for (name in ref) {
+          sig = ref[name];
+          sig.step(cyc);
+        }
+        return this;
+      }
+
+      // @exclude
+      /*
+      Operate on a representative signal, then update the cycle time of other signals in this set correspondingly.
+      @param {SignalValue} rep the representative signal
+      @param {function} fn function of the form (rep) -> that operates on the representative signal (though the 'rep' argument need not be used since the calling context knowns it anyway)
+      @return the return value of func
+      */
+      do(rep, fn) {
+        var delta, name, origCyc, ref, ret, sig;
+        origCyc = rep.getCycle();
+        ret = fn(rep);
+        delta = rep.getCycle() - origCyc;
+        ref = this._sigs;
+        for (name in ref) {
+          sig = ref[name];
+          if (sig !== rep) {
+            sig.step(delta);
+          }
+        }
+        return ret;
+      }
+
+      
+        // @include
+      /*
+      Step forward at least one cycle until the representative signal's value asInt is the given value
+      or the end of the trace is reached (stopping offEnd).
+      @param {SignalValue} rep the representative signal
+      @param {int} val the signal value to step to
+      @return {boolean} `true` on success
+      */
+      forwardToValue(rep, val) {
+        return this.do(rep, function() {
+          return rep.forwardToValue(val);
+        });
+      }
+
+      /*
+      Step backward at least one cycle until the representative signal's value asInt is the given value
+      or the beginning of the trace is reached (stopping offBeginning).
+      @param {SignalValue} rep the representative signal
+      @param {int} val the signal value to step to
+      @return {boolean} `true` on success
+      */
+      backToValue(rep, val) {
+        return this.do(rep, function() {
+          return rep.backToValue(val);
+        });
+      }
+
+      /*
+      Step forward (positive) or backward (negative) the given number of transitions (value changes).
+      @param {SignalValue} rep the representative signal
+      @param {int} steps the number of transitions to step
+      @return {SignalValueSet} this {SignalValueSet} (for chaining)
+      */
+      stepTransition(rep, steps = 1) {
+        return this.do(rep, function() {
+          return rep.stepTransition(steps);
+        });
+      }
+
+      
+        // These are not timing abstract and should be deprecated.
+      // @exclude 
+      /*
+      Step all signals to the given cycle (forward or backward).
+      Same result as jumpToCycle(cycle), but it walks transitions, rather than jumping
+      through anchor points, so it is best for small deltas.
+      @param {int} cyc
+      @return {SignalValueSet} (for chaining)
+      */
+      stepTo(cyc) {
+        var name, ref, sig;
+        ref = this._sigs;
+        for (name in ref) {
+          sig = ref[name];
+          sig.stepTo(cyc);
+        }
+        return this;
+      }
+
+      /*
+      Go to the given cycle as efficiently as possible.
+      @param {int} cyc the cycle to go to.
+      @return {SignalValueSet} (for chaining)
+      */
+      goTo(cyc) {
+        var name, ref, sig;
+        ref = this._sigs;
+        for (name in ref) {
+          sig = ref[name];
+          sig.goTo(cyc);
+        }
+        return this;
+      }
+
+      /*
+      Go to the beginning of the trace.
+      @return {SignalValueSet} (for chaining)
+      */
+      goToSimStart() {
+        var name, ref, sig;
+        ref = this._sigs;
+        for (name in ref) {
+          sig = ref[name];
+          sig.goToSimStart();
+        }
+        return this;
+      }
+
+      /*
+      Go to the beginning of the trace.
+      @return {SignalValueSet} (for chaining)
+      */
+      goToSimEnd() {
+        var name, ref, sig;
+        ref = this._sigs;
+        for (name in ref) {
+          sig = ref[name];
+          sig.goToSimEnd();
+        }
+        return this;
+      }
+
+    };
+
+    
+    // @exclude
+
+    // @property {Object} The set of SignalValue's.
+    SignalValueSet.prototype._sigs = null;
+
+    return SignalValueSet;
+
+  }).call(this);
+
+  define(function(require, exports, module) {
+    $ = require("jquery");
+    Utils = require("Utils");
+    $.extend(SignalValueSet.prototype, module.config());
+    return SignalValueSet;
+  });
+
+}).call(this);
